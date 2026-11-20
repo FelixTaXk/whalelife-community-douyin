@@ -1,0 +1,10 @@
+{
+  "name": "whalelife-plugin-douyin",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "WhaleLife 抖音子插件（surf/sub/douyin）",
+  "dependencies": {
+    "abogus": "^2.1.1"
+  }
+}
