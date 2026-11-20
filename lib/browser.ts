@@ -2,6 +2,7 @@
 
 import { spawn } from 'node:child_process';
 import { connect } from 'node:net';
+import { randomBytes } from 'node:crypto';
 import { existsSync, mkdirSync, readFileSync, writeFileSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
 
@@ -37,6 +38,30 @@ let current: Spawned | null = null;
 
 function stateFile(dir: string) {
   return join(dir, 'login.json');
+}
+
+// 会话归属标记：open 时生成并写进专用 profile 的 localStorage，读 Cookie 前必须对上。
+export function loginToken(dir: string): string | null {
+  try {
+    const stored = JSON.parse(readFileSync(stateFile(dir), 'utf8'));
+    return typeof stored?.token === 'string' && stored.token ? stored.token : null;
+  } catch {
+    return null;
+  }
+}
+
+function ensureToken(dir: string): string {
+  const existing = loginToken(dir);
+  if (existing) return existing;
+  const token = randomBytes(16).toString('hex');
+  let stored: any = {};
+  try {
+    stored = JSON.parse(readFileSync(stateFile(dir), 'utf8'));
+  } catch {
+    stored = {};
+  }
+  writeFileSync(stateFile(dir), JSON.stringify({ ...stored, token }, null, 2), 'utf8');
+  return token;
 }
 
 export function loginState(dir: string): LoginState {
@@ -109,11 +134,16 @@ export async function openLoginWindow(
   mode: WindowMode = 'visible',
 ): Promise<{ ok: boolean; message?: string; state?: LoginState }> {
   // 只认一件事：调试端口能不能握手。PID 探活会被系统复用骗到，端口在听也可能是僵尸实例。
-  if (await cdpAlive(port)) return { ok: true, message: '登录窗口已经开着，不用重复打开。', state: loginState(dir) };
+  if (await cdpAlive(port)) {
+    // 端口已被某个实例占着时，也补一个归属标记，避免把别人的浏览器当成自己的。
+    ensureToken(dir);
+    return { ok: true, message: '登录窗口已经开着，不用重复打开。', state: loginState(dir) };
+  }
   const browser = findBrowser();
   if (!browser) return { ok: false, message: '没找到 Chrome 或 Edge，无法自动打开登录窗口。' };
   const profile = join(dir, 'browser-profile');
   mkdirSync(profile, { recursive: true });
+  const sessionToken = ensureToken(dir);
   const args = [
     `--remote-debugging-port=${port}`,
     `--user-data-dir=${profile}`,
@@ -134,7 +164,7 @@ export async function openLoginWindow(
     const child = spawn(browser, args, { detached: true, stdio: 'ignore', windowsHide: false });
     child.unref();
     current = { pid: child.pid, port, profile };
-    writeFileSync(stateFile(dir), JSON.stringify({ pid: child.pid, port, profile, mode, at: Date.now() }, null, 2), 'utf8');
+    writeFileSync(stateFile(dir), JSON.stringify({ pid: child.pid, port, profile, mode, token: sessionToken, at: Date.now() }, null, 2), 'utf8');
     const ready = await Promise.race([storageReady(port), sleep(3000).then(() => false)]);
     const label = mode === 'headless' ? '无界面' : mode === 'offscreen' ? '隐藏' : '可见';
     if (!ready) return { ok: true, message: `登录窗口已打开（${label}模式）；调试端口还在启动，等你登录完再点读取。`, state: loginState(dir) };
@@ -162,7 +192,16 @@ export function closeLoginWindow(dir: string): { ok: boolean; message: string } 
 
 type CookieRow = { name: string; value: string; domain: string; path: string; expires: number; secure?: boolean; httpOnly?: boolean };
 
-export async function readCookies(port: number): Promise<{ ok: boolean; cookie?: string; count?: number; hasSession?: boolean; message?: string }> {
+export async function readCookies(
+  port: number,
+  expectedToken?: string,
+): Promise<{ ok: boolean; cookie?: string; count?: number; hasSession?: boolean; message?: string }> {
+  if (!expectedToken) {
+    return {
+      ok: false,
+      message: '无法确认这个调试端口属于插件自己启动的专用会话，读 Cookie 已拒绝。请点「打开登录窗口」重新打开专用窗口。',
+    };
+  }
   if (!(await storageReady(port))) return { ok: false, message: '调试端口没响应，先打开登录窗口。' };
   let targets: any[] = [];
   try {
@@ -184,7 +223,13 @@ export async function readCookies(port: number): Promise<{ ok: boolean; cookie?:
     const timer = setTimeout(() => finish({ __error: '调试连接超时。' }), 8000);
     timer.unref?.();
     ws.addEventListener('open', () => {
-      ws.send(JSON.stringify({ id: 1, method: 'Storage.getCookies', params: {} }));
+      ws.send(
+        JSON.stringify({
+          id: 1,
+          method: 'Runtime.evaluate',
+          params: { expression: 'localStorage.getItem("__dl_session")||""', returnByValue: true },
+        }),
+      );
     });
     ws.addEventListener('message', (event) => {
       let message: any;
@@ -194,6 +239,19 @@ export async function readCookies(port: number): Promise<{ ok: boolean; cookie?:
         return;
       }
       if (message.id === 1) {
+        // 先核对会话归属，对上了才去取 Cookie。
+        const got = String(message?.result?.result?.value ?? '');
+        if (got !== expectedToken) {
+          clearTimeout(timer);
+          finish({
+            __error: '这个调试端口上的浏览器不是插件自己启动的专用会话，读 Cookie 已拒绝。请点「打开登录窗口」重新打开专用窗口。',
+          });
+          return;
+        }
+        ws.send(JSON.stringify({ id: 2, method: 'Storage.getCookies', params: {} }));
+        return;
+      }
+      if (message.id === 2) {
         clearTimeout(timer);
         finish(message);
       }

@@ -3,10 +3,9 @@
 import type { Context } from 'whalelife';
 import { join } from 'node:path';
 import { existsSync } from 'node:fs';
-import { readFile } from 'node:fs/promises';
 import { createApi, cookieHeader, isLoggedIn, type Account } from './lib/api.ts';
 import { coverUrl, download, pickPlayUrl } from './lib/media.ts';
-import { closeLoginWindow, cdpAlive, loginState, openLoginWindow, portOpen as portOpenFn, readCookies } from './lib/browser.ts';
+import { closeLoginWindow, cdpAlive, loginState, loginToken, openLoginWindow, portOpen as portOpenFn, readCookies } from './lib/browser.ts';
 import { publishImages, connectCdp } from './lib/creator.ts';
 import { comfyGenerate } from './lib/comfy.ts';
 import { renderTextCard } from './lib/textcard.ts';
@@ -1122,7 +1121,7 @@ ol.steps{margin:0;padding-left:20px;font-size:13px;color:var(--muted);line-heigh
   <div class="check"><input type="checkbox" id="autoOpen" ${cfg.autoFeedOpenWindow ? 'checked' : ''}><label for="autoOpen" style="display:block">在登录窗口里依次打开（每条停 4 秒）</label></div>
   <div class="check"><input type="checkbox" id="autoScroll" ${cfg.autoFeedScroll ? 'checked' : ''}><label for="autoScroll" style="display:block">连续滑（像真人一条条往下切，滚不动时补方向键）</label></div>
   <div class="check"><input type="checkbox" id="autoLike" ${cfg.autoInteractEnabled ? 'checked' : ''}><label for="autoLike" style="display:block">刷到合适的自动点赞 + 收藏（只点赞收藏，永不评论）</label></div>
-  <label style="margin-top:12px">人设关键词（留空 = 自动从本体人格配置取）<textarea id="autoPersona" rows="3" placeholder="留空就会从 memory/personas 里的当前人格自动取">${String(cfg.autoInteractPersona).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')}</textarea></label>
+  <label style="margin-top:12px">人设关键词（必填，命中就赞；插件只读这里的词，不读宿主人格配置）<textarea id="autoPersona" rows="3" placeholder="按你自己的人设挑词，逗号或换行分隔，例如：水彩,拍照,胶片,手账">${String(cfg.autoInteractPersona).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')}</textarea></label>
   <p class="note" id="personaLine"></p>
   <label style="margin-top:12px">白名单类型（命中且分享数过门槛才赞）<textarea id="autoWhite" rows="3" placeholder="AI,游戏,数码">${String(cfg.autoInteractWhitelist).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')}</textarea></label>
   <div class="grid">
@@ -1250,7 +1249,7 @@ document.getElementById('runAp').onclick=async()=>{const m=document.getElementBy
 const refreshQueue=async()=>{try{const r=await fetch('${base}/queue?_='+Date.now(),{cache:'no-store'});const j=await r.json();const its=(j&&j.items)||[];const pend=its.filter(x=>x.status==='pending');document.getElementById('queueList').textContent=pend.length?('待发布：'+pend.map(x=>new Date(x.at).toLocaleString('zh-CN')+' · '+String(x.desc).slice(0,20)).join(' / ')):'没有待发布的定时任务。';}catch(e){}};
 refreshQueue();
 const refreshAuto=async()=>{try{const r=await fetch('${base}/auto/state?_='+Date.now(),{cache:'no-store'});const j=await r.json();const rounds=(j.rounds||[]);const last=rounds[0];document.getElementById('autoLog').textContent=j.enabled?('自动刷已开：每 '+j.minutes+' 分钟刷 '+j.count+' 条'+(j.scroll?'（窗口内连续滑）':'（逐条打开）')+(j.nextAt?'，下次 '+(new Date(j.nextAt)).toLocaleString('zh-CN'):'')+(last?('；上一轮 '+((last.items&&last.items.length)||0)+' 条'+(last.interacted?('，赞藏 '+last.interacted.filter(x=>x.ok&&x.action==='like').length+' 次'):'')):'')):'自动刷未开启。';
-const pl=document.getElementById('personaLine');if(pl){pl.textContent=j.interact?(j.personaFrom==='manual'?'人设：使用手填关键词（'+((j.personaWords||[]).join('、'))+'）':('人设：取自 '+(j.personaSource||'人格文件')+'，提取 '+(j.personaWords||[]).length+' 个词：'+((j.personaWords||[]).slice(0,8).join('、')||'（没提取到，检查人格文件里有没有「喜欢：」这类行）'))):'自动赞藏未开启。';}catch(e){}};
+const pl=document.getElementById('personaLine');if(pl){pl.textContent=j.interact?(((j.personaWords||[]).length)?('人设关键词 '+(j.personaWords||[]).length+' 个：'+(j.personaWords||[]).join('、')):'人设关键词还没填，填了才会开始点赞'):'自动赞藏未开启。';}catch(e){}};
 refreshAuto();
 document.getElementById('saveAuto').onclick=async()=>{const j=await postJson('config',{config:{autoFeedEnabled:document.getElementById('autoOn').checked,autoFeedMinutes:Number(document.getElementById('autoMin').value),autoFeedCount:Number(document.getElementById('autoCount').value),autoFeedOpenWindow:document.getElementById('autoOpen').checked,autoFeedScroll:document.getElementById('autoScroll').checked,windowMode:document.getElementById('winMode').value,autoInteractEnabled:document.getElementById('autoLike').checked,autoInteractPersona:document.getElementById('autoPersona').value,autoInteractWhitelist:document.getElementById('autoWhite').value,autoInteractMinShare:Number(document.getElementById('autoShare').value),autoInteractMaxPerRound:Number(document.getElementById('autoMax').value)}});document.getElementById('autoMsg').textContent=j.ok?'已保存（窗口模式改完要关掉窗口再重开才生效）。':'保存失败：'+(j.error||'');refreshAuto();};
 document.getElementById('runAuto').onclick=async()=>{const m=document.getElementById('autoMsg');m.textContent='正在跑一轮…';try{const j=await postJson('auto/run');if(j.ok){const its=(j.round&&j.round.items)||[];m.textContent='刷了 '+its.length+' 条：'+its.map(x=>String(x.desc).slice(0,12)).join(' / ');}else{m.textContent='失败：'+(j.message||'未知');}refreshAuto();}catch(e){m.textContent='请求失败：'+(e&&e.message||e);}};
@@ -1337,6 +1336,17 @@ document.getElementById('i').onsubmit=async e=>{e.preventDefault();const t=e.tar
   ctx.web.api(`${base}/login/open`, async (_req: any, res: any) => {
     const result = await openLoginWindow(DATA_DIR, LOGIN_PORT, 'https://www.douyin.com/', config.windowMode);
     const cdp = await cdpAlive(LOGIN_PORT);
+    // 把会话归属标记写进专用窗口，之后读 Cookie 才有据可依。
+    const token = loginToken(DATA_DIR);
+    if (result.ok && token && cdp) {
+      const conn = await connectCdp(LOGIN_PORT);
+      if (conn) {
+        try {
+          await conn.evaluate(`localStorage.setItem("__dl_session",${JSON.stringify(token)})`);
+        } catch {}
+        conn.close();
+      }
+    }
     sendJson(res, 200, { ok: result.ok, message: result.message, open: cdp || result.ok, portOpen: cdp });
   });
 
@@ -1347,7 +1357,7 @@ document.getElementById('i').onsubmit=async e=>{e.preventDefault();const t=e.tar
 
   ctx.web.api(`${base}/login/import`, async (_req: any, res: any) => {
     try {
-      const cookies = await readCookies(LOGIN_PORT);
+      const cookies = await readCookies(LOGIN_PORT, loginToken(DATA_DIR) ?? undefined);
       if (!cookies.ok || !cookies.cookie) {
         sendJson(res, 200, { ok: false, loggedIn: false, message: cookies.message ?? '读取 Cookie 失败。' });
         return;
@@ -1503,7 +1513,6 @@ document.getElementById('i').onsubmit=async e=>{e.preventDefault();const t=e.tar
     const state = await readAutoState();
     const nextAt = config.autoFeedEnabled ? state.lastRunAt + config.autoFeedMinutes * 60000 : 0;
     const manualPersona = splitKeywords(config.autoInteractPersona);
-    const personaWords = manualPersona.length ? manualPersona : await loadPersonaWords();
     sendJson(res, 200, {
       ok: true,
       enabled: config.autoFeedEnabled,
@@ -1512,9 +1521,8 @@ document.getElementById('i').onsubmit=async e=>{e.preventDefault();const t=e.tar
       openWindow: config.autoFeedOpenWindow,
       scroll: config.autoFeedScroll,
       interact: config.autoInteractEnabled,
-      personaFrom: manualPersona.length ? 'manual' : 'persona-file',
-      personaSource: personaCache.source,
-      personaWords: personaWords.slice(0, 12),
+      personaFrom: 'manual',
+      personaWords: manualPersona.slice(0, 12),
       lastRunAt: state.lastRunAt || null,
       nextAt: nextAt || null,
       rounds: state.rounds.slice(-5).reverse(),
@@ -1599,58 +1607,12 @@ document.getElementById('i').onsubmit=async e=>{e.preventDefault();const t=e.tar
       .map((x) => x.trim().toLowerCase())
       .filter(Boolean);
 
-  // 从本体人格文件里抽「喜欢 / 爱吃」这类行的关键词，抽一次缓存 5 分钟。
-  const personaCache: { at: number; words: string[]; source: string } = { at: 0, words: [], source: '' };
-
-  const extractPersonaWords = (text: string): string[] => {
-    const out = new Set<string>();
-    const noise = /[的地得不了很太都就还也又没不]/;
-    for (const line of text.split(/\r?\n/)) {
-      const trimmed = line.trim();
-      if (!/^(喜欢|爱吃|吃|爱好|兴趣|偏好|口味)[：:]/.test(trimmed)) continue;
-      const body = trimmed.replace(/^[^：:]*[：:]/, '');
-      for (const clause of body.split(/[；;。]/)) {
-        const withBracket = clause.match(/^([^（(]{2,7})[（(]([^）)]*)[）)]/);
-        const push = (word: string) => {
-          let clean = word.trim().replace(/^[、，,\s]+|[、，,\s]+$/g, '');
-          clean = clean.replace(/^(喜欢|爱)(吃|喝|看|玩|听|做|拍|画)?/, '');
-          if (clean.length >= 2 && clean.length <= 6 && !noise.test(clean)) out.add(clean);
-        };
-        if (withBracket) {
-          push(withBracket[1]);
-          for (const part of withBracket[2].split(/[、，,+＋\/]/)) push(part);
-        } else {
-          for (const part of clause.split(/[，,]/)) push(part);
-        }
-      }
-    }
-    return [...out].slice(0, 40);
-  };
-
-  const loadPersonaWords = async (): Promise<string[]> => {
-    if (Date.now() - personaCache.at < 300000) return personaCache.words;
-    try {
-      const root = join(import.meta.dirname, '..', '..', '..', '..');
-      const raw = JSON.parse(await readFile(join(root, 'config', 'config.json'), 'utf8'));
-      const personaId = raw?.channels?.web?.persona ?? Object.keys(raw?.personas ?? {})[0];
-      const rel = raw?.personas?.[personaId]?.file;
-      if (!rel) return personaCache.words;
-      const text = await readFile(join(root, String(rel)), 'utf8');
-      personaCache.words = extractPersonaWords(text);
-      personaCache.source = `${String(raw?.personas?.[personaId]?.name ?? personaId)}（${rel}）`;
-      personaCache.at = Date.now();
-      return personaCache.words;
-    } catch {
-      return personaCache.words;
-    }
-  };
-
-  // 命中人设关键词 → 赞；命中白名单类型且分享数过门槛 → 赞。只点赞收藏，永不评论。
-  const autoInteractReason = async (item: any): Promise<string> => {
+  // 命中设置页填的人设关键词 → 赞；命中白名单类型且分享数过门槛 → 赞。只点赞收藏，永不评论。
+  // 只读插件自己的配置，不读取宿主全局配置或人格文件。
+  const autoInteractReason = (item: any): string => {
     const text = `${String(item?.desc ?? '')} ${String(item?.author?.nickname ?? '')}`.toLowerCase();
-    const manual = splitKeywords(config.autoInteractPersona);
-    const persona = manual.length ? manual : (await loadPersonaWords()).map((x) => x.toLowerCase());
-    if (persona.length && persona.some((k) => text.includes(k))) return manual.length ? 'persona' : 'persona-file';
+    const persona = splitKeywords(config.autoInteractPersona);
+    if (persona.length && persona.some((k) => text.includes(k))) return 'persona';
     const white = splitKeywords(config.autoInteractWhitelist);
     const share = Number(item?.stats?.share ?? 0);
     if (white.length && white.some((k) => text.includes(k)) && share >= config.autoInteractMinShare) return 'whitelist';
