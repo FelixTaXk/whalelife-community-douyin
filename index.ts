@@ -2,7 +2,6 @@
 
 import type { Context } from 'whalelife';
 import { join } from 'node:path';
-import { existsSync } from 'node:fs';
 import { createApi, cookieHeader, isLoggedIn, type Account } from './lib/api.ts';
 import { coverUrl, download, pickPlayUrl } from './lib/media.ts';
 import { closeLoginWindow, cdpAlive, loginState, loginToken, openLoginWindow, portOpen as portOpenFn, readCookies, verifySession } from './lib/browser.ts';
@@ -12,7 +11,6 @@ import { renderTextCard } from './lib/textcard.ts';
 import { swipeRecommend } from './lib/swipe.ts';
 
 const DATA_DIR = join(import.meta.dirname, 'data');
-const LOGIN_PORT = 9224;
 
 type Config = {
   feedCount: number;
@@ -40,6 +38,9 @@ type Config = {
   autoInteractMinShare: number;
   autoInteractMaxPerRound: number;
   windowMode: 'visible' | 'offscreen' | 'headless';
+  loginPort: number;
+  browserPath: string;
+  textCardTitle: string;
   autoPublishEnabled: boolean;
   autoPublishMode: 'fixed' | 'random';
   autoPublishTimes: string;
@@ -77,6 +78,12 @@ const DEFAULTS: Config = {
   autoInteractMinShare: 5000,
   autoInteractMaxPerRound: 1,
   windowMode: 'offscreen',
+  // 登录窗口的调试端口：多实例共存时可在设置页改成别的端口，避免抢同一个端口。
+  loginPort: 9224,
+  // 浏览器可执行文件路径：留空则自动探测系统里的 Chrome / Edge。
+  browserPath: '',
+  // 文字卡片标题：留空则不加标题（不预设任何个人文案）。
+  textCardTitle: '',
   autoPublishEnabled: false,
   autoPublishMode: 'fixed',
   autoPublishTimes: '09:00,20:00',
@@ -204,6 +211,9 @@ export async function apply(ctx: Context) {
       autoInteractMinShare: num(stored.autoInteractMinShare, DEFAULTS.autoInteractMinShare, 0, 1000000),
       autoInteractMaxPerRound: num(stored.autoInteractMaxPerRound, DEFAULTS.autoInteractMaxPerRound, 1, 3),
       windowMode: (['visible', 'offscreen', 'headless'].includes(String(stored.windowMode)) ? String(stored.windowMode) : DEFAULTS.windowMode) as Config['windowMode'],
+      loginPort: num(stored.loginPort, DEFAULTS.loginPort, 1024, 65535),
+      browserPath: String(stored.browserPath ?? DEFAULTS.browserPath).slice(0, 400),
+      textCardTitle: String(stored.textCardTitle ?? DEFAULTS.textCardTitle).slice(0, 60),
       autoPublishEnabled: bool(stored.autoPublishEnabled, DEFAULTS.autoPublishEnabled),
       autoPublishMode: (String(stored.autoPublishMode) === 'random' ? 'random' : 'fixed') as Config['autoPublishMode'],
       autoPublishTimes: String(stored.autoPublishTimes ?? DEFAULTS.autoPublishTimes).slice(0, 200),
@@ -256,8 +266,8 @@ export async function apply(ctx: Context) {
 
   // 复用登录导入的归属检查：窗口必须是本插件启动且会话标记对得上，否则不往它里面发任何操作。
   const ensureOwnedWindow = async (): Promise<{ ok: boolean; message: string }> => {
-    if (!(await cdpAlive(LOGIN_PORT))) return { ok: false, message: '登录窗口没开。请先点「打开登录窗口」。' };
-    const check = await verifySession(DATA_DIR, LOGIN_PORT);
+    if (!(await cdpAlive(config.loginPort))) return { ok: false, message: '登录窗口没开。请先点「打开登录窗口」。' };
+    const check = await verifySession(DATA_DIR, config.loginPort);
     if (check.owned) return { ok: true, message: '' };
     return { ok: false, message: `该窗口无法确认属于当前实例（${check.reason ?? '会话标记对不上'}）。请先点「关闭登录窗口」，再重新打开专用窗口。` };
   };
@@ -285,7 +295,7 @@ export async function apply(ctx: Context) {
     if (!images.length) {
       return { ok: false as const, code: 'no_image', message: '没有图片。给本地路径，或者用 ComfyUI 提示词生成。' };
     }
-    return publishImages(LOGIN_PORT, { images, desc: input.desc });
+    return publishImages(config.loginPort, { images, desc: input.desc });
   };
 
   const drainQueue = async () => {
@@ -293,9 +303,9 @@ export async function apply(ctx: Context) {
     const items = await readQueue();
     const due = items.filter((x) => x.status === 'pending' && Number(x.at) <= Date.now());
     if (!due.length) return;
-    if (!(await cdpAlive(LOGIN_PORT))) {
-      await openLoginWindow(DATA_DIR, LOGIN_PORT, 'https://creator.douyin.com/creator-micro/content/upload', config.windowMode).catch(() => null);
-      for (let i = 0; i < 20 && !(await cdpAlive(LOGIN_PORT)); i += 1) await new Promise((r) => setTimeout(r, 1000));
+    if (!(await cdpAlive(config.loginPort))) {
+      await openLoginWindow(DATA_DIR, config.loginPort, 'https://creator.douyin.com/creator-micro/content/upload', config.windowMode, config.browserPath).catch(() => null);
+      for (let i = 0; i < 20 && !(await cdpAlive(config.loginPort)); i += 1) await new Promise((r) => setTimeout(r, 1000));
     }
     const owned = await ensureOwnedWindow();
     if (!owned.ok) {
@@ -308,7 +318,7 @@ export async function apply(ctx: Context) {
       return;
     }
     for (const item of due) {
-      const result = await publishImages(LOGIN_PORT, { images: item.images, desc: item.desc });
+      const result = await publishImages(config.loginPort, { images: item.images, desc: item.desc });
       item.status = result.ok ? 'done' : 'failed';
       item.message = result.message;
       await saveQueue(items);
@@ -979,7 +989,7 @@ export async function apply(ctx: Context) {
     ),
     description:
       '往抖音发一条图文：desc 是作品描述；images 给本地图片绝对路径（最多 9 张）；没图片但给了 comfyPrompt 就用 ComfyUI 生成；' +
-      'at 写 2026-11-19 21:30 这类时间即定时发布，留空立即发。发布是对外可见的真实操作，要求设置页打开发布开关、登录窗口开着。' +
+      'at 按本机时区写「YYYY-MM-DD HH:mm」即定时发布，留空立即发。发布是对外可见的真实操作，要求设置页打开发布开关、登录窗口开着。' +
       '发布成功不等于有人看到或审核通过。',
     async run(args: any, session: any): Promise<any> {
       const desc = String(args?.desc ?? '').trim();
@@ -996,7 +1006,7 @@ export async function apply(ctx: Context) {
         const ts = Date.parse(at.replace(/-/g, '/'));
         if (!Number.isFinite(ts)) {
           return {
-            content: { status: 'error', error: { code: 'bad_time', message: '时间格式不对，用 2026-11-19 21:30。' } },
+            content: { status: 'error', error: { code: 'bad_time', message: '时间格式不对，用「YYYY-MM-DD HH:mm」，例如 2030-01-01 09:30。' } },
             receipt: { action: 'douyin_publish', status: 'error', code: 'bad_time' },
           };
         }
@@ -1105,6 +1115,18 @@ ol.steps{margin:0;padding-left:20px;font-size:13px;color:var(--muted);line-heigh
 </section>
 
 <section class="card">
+  <h2>本机连接</h2>
+  <p class="note">窗口用哪个浏览器、走哪个调试端口都由这里决定，留空就自动探测（Windows 查 Chrome / Edge，macOS 查 Chrome / Edge / Chromium）。改完端口或浏览器路径要先把登录窗口关掉，再重新打开才生效。</p>
+  <div class="grid">
+    <label>调试端口<input type="number" id="lPort" min="1024" max="65535" value="${cfg.loginPort}"></label>
+    <label>浏览器可执行文件路径（留空自动探测）<input id="lBrowser" value="${String(cfg.browserPath).replace(/"/g, '&quot;')}" placeholder="留空自动探测"></label>
+  </div>
+  <label style="margin-top:12px">文字卡片标题（自主发布选「纯文字」时用；留空不标题）<input id="cardTitle" maxlength="60" value="${String(cfg.textCardTitle).replace(/"/g, '&quot;')}" placeholder="留空即只渲染正文"></label>
+  <div class="row"><button class="primary" type="button" id="saveLocal">保存本机连接</button></div>
+  <p class="note" id="localMsg"></p>
+</section>
+
+<section class="card">
   <h2>手动粘贴（备用）</h2>
   <p class="note">不想让插件开窗口时，自己在浏览器登录 douyin.com，F12 控制台输入 <code>document.cookie</code> 复制整段粘进来。${account?.cookie ? '已保存一段，留空表示不改。' : '现在还没有配置。'}<br>Cookie 只存本机 <code>data/account.json</code>，不会写进日志或回执。</p>
   <form id="c">
@@ -1123,9 +1145,9 @@ ol.steps{margin:0;padding-left:20px;font-size:13px;color:var(--muted);line-heigh
   <p class="note" id="nowMsg">点「现在刷一条」，随机刷一条并告诉你刷到了什么。</p>
   <div id="postBox" style="display:none;margin-top:16px">
     <label>作品描述（必填）<textarea id="pDesc" placeholder="写点什么，最多 1000 字"></textarea></label>
-    <label style="margin-top:12px">图片本地路径（每行一个，最多 9 张；留空则用 ComfyUI 生成）<textarea id="pImgs" placeholder="D:\\AI\\图片\\a.png"></textarea></label>
+    <label style="margin-top:12px">图片本地路径（每行一个，最多 9 张；留空则用 ComfyUI 生成）<textarea id="pImgs" placeholder="每行一个绝对路径，例如 C:\\Users\\你的用户名\\Pictures\\1.png"></textarea></label>
     <label style="margin-top:12px">ComfyUI 提示词（要生图时填）<input id="pPrompt" placeholder="例如：赛博朋克夜市，霓虹灯，竖构图"></label>
-    <label style="margin-top:12px">发布时机（留空=现在；或写 2026-11-19 21:30）<input id="pAt" placeholder="留空立即发布"></label>
+    <label style="margin-top:12px">发布时机（留空=现在；或写 YYYY-MM-DD HH:mm，按本机时区）<input id="pAt" placeholder="留空立即发布"></label>
     <div class="row"><button class="primary" type="button" id="pSend">发布到抖音</button><span class="note" id="pubHint">发布是对外可见的真实操作</span></div>
   </div>
 </section>
@@ -1189,7 +1211,7 @@ ol.steps{margin:0;padding-left:20px;font-size:13px;color:var(--muted);line-heigh
   <h2>发布设置</h2>
   <div class="check" style="margin-top:0"><input type="checkbox" id="pub" ${cfg.publishEnabled ? 'checked' : ''}><label for="pub" style="display:block">允许发布到抖音（发出去就是对外可见的，默认关）</label></div>
   <label style="margin-top:14px">ComfyUI 地址<input id="comfy" value="${cfg.comfyServer}"></label>
-  <label style="margin-top:12px">ComfyUI workflow（API 格式 JSON 的本地路径）<input id="wf" value="${cfg.comfyWorkflow}" placeholder="D:\\AI\\comfy\\txt2img_api.json"></label>
+  <label style="margin-top:12px">ComfyUI workflow（API 格式 JSON 的本地路径）<input id="wf" value="${cfg.comfyWorkflow}" placeholder="例如 C:\\Users\\你的用户名\\ComfyUI\\workflows\\txt2img_api.json"></label>
   <div class="row"><button class="primary" type="button" id="savePub">保存发布设置</button></div>
   <p class="note" id="pubMsg"></p>
   <p class="note" id="queueList"></p>
@@ -1248,11 +1270,12 @@ const msgEl=document.getElementById('loginMsg');
 const say=(t,ok)=>{msgEl.textContent=t;msgEl.style.color=ok?'#1f7a4d':'#9a3030';};
 const setBadge=(on)=>{const b=document.getElementById('badge');if(b){b.textContent=on?'已登录':'未登录';b.style.color=on?'#1f7a4d':'#9a3030';}};
 const callLogin=async(name)=>{say('处理中…',true);try{const r=await fetch('${base}/login/'+name+'?_='+Date.now(),{method:'POST',headers:{'Content-Type':'application/json'},body:'{}',cache:'no-store'});const j=await r.json();say((j.message||(j.ok?'完成。':'失败。'))+(j.count?(' · 读到 '+j.count+' 个 Cookie'):''),j.ok!==false);if(name==='import'&&j.loggedIn)setBadge(true);refreshLogin();return j;}catch(e){say('请求失败：'+(e&&e.message||e),false);}};
-const refreshLogin=async()=>{try{const j=await stateGet('${base}/login/state?_='+Date.now());const mn={visible:'可见',offscreen:'隐藏',headless:'无界面'};const label=j.open?('已打开（'+((j.mode&&mn[j.mode])||'可用')+'）'):(j.portOpen?'端口在听但连不上，关掉重开一次':'未打开');stateEl.textContent='窗口状态：'+label;}catch(e){stateEl.textContent='窗口状态：读取失败，刷新页面重试';}};
+const refreshLogin=async()=>{try{const j=await stateGet('${base}/login/state?_='+Date.now());const mn={visible:'可见',offscreen:'隐藏',headless:'无界面'};const label=j.open?('已打开（'+((j.mode&&mn[j.mode])||'可用')+'）'):(j.portOpen?'端口在听但连不上，关掉重开一次':'未打开');const br=j.browser?String(j.browser).split(/[\\\\/]/).pop():'没找到浏览器';stateEl.textContent='窗口状态：'+label+' ｜ 端口 '+(j.port||'?')+' ｜ 浏览器 '+br;}catch(e){stateEl.textContent='窗口状态：读取失败，刷新页面重试';}};
 refreshLogin(); setInterval(refreshLogin,5000);
 document.getElementById('open').onclick=()=>callLogin('open');
 document.getElementById('import').onclick=()=>callLogin('import');
 document.getElementById('close').onclick=()=>callLogin('close');
+document.getElementById('saveLocal').onclick=async()=>{try{const j=await postJson('config',{config:{loginPort:Number(document.getElementById('lPort').value),browserPath:document.getElementById('lBrowser').value.trim(),textCardTitle:document.getElementById('cardTitle').value.trim()}});document.getElementById('localMsg').textContent=j.ok?'已保存。端口或浏览器路径改过的话，关掉登录窗口再重开才生效。':'保存失败：'+(j.error||'');refreshLogin();}catch(e){document.getElementById('localMsg').textContent='保存失败：'+(e&&e.message||e);}};
 const postJson=async(path,body)=>{const r=await fetch('${base}/'+path+'?_='+Date.now(),{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body||{}),cache:'no-store'});return r.json();};
 const nowMsg=document.getElementById('nowMsg');
 document.getElementById('nowFeed').onclick=async()=>{nowMsg.textContent='正在刷…';try{const j=await postJson('now/feed');if(!j.ok){nowMsg.textContent='没刷到：'+(j.message||'失败');return;}const it=j.item||{};nowMsg.textContent='刷到：'+(it.desc||'（无文案）')+' ｜ 作者 '+((it.author&&it.author.nickname)||'?')+' ｜ 点赞 '+((it.stats&&it.stats.digg)!=null?it.stats.digg:'?')+(j.opened?' ｜ 已在窗口打开':(j.windowAlive?' ｜ 窗口开着但没跳转':' ｜ 登录窗口没开，只拉了一条数据'));}catch(e){nowMsg.textContent='请求失败：'+(e&&e.message||e);}};
@@ -1330,6 +1353,9 @@ document.getElementById('i').onsubmit=async e=>{e.preventDefault();const t=e.tar
         windowMode: (['visible', 'offscreen', 'headless'].includes(String(patch.windowMode))
           ? String(patch.windowMode)
           : current.windowMode) as Config['windowMode'],
+        loginPort: patch.loginPort === undefined ? current.loginPort : num(patch.loginPort, current.loginPort, 1024, 65535),
+        browserPath: patch.browserPath === undefined ? current.browserPath : String(patch.browserPath || '').trim().slice(0, 400),
+        textCardTitle: patch.textCardTitle === undefined ? current.textCardTitle : String(patch.textCardTitle || '').trim().slice(0, 60),
         autoPublishEnabled: patch.autoPublishEnabled === undefined ? current.autoPublishEnabled : bool(patch.autoPublishEnabled, current.autoPublishEnabled),
         autoPublishMode: (String(patch.autoPublishMode) === 'random' ? 'random' : patch.autoPublishMode === 'fixed' ? 'fixed' : current.autoPublishMode) as Config['autoPublishMode'],
         autoPublishTimes: patch.autoPublishTimes === undefined ? current.autoPublishTimes : String(patch.autoPublishTimes || '').slice(0, 200),
@@ -1348,37 +1374,39 @@ document.getElementById('i').onsubmit=async e=>{e.preventDefault();const t=e.tar
   });
 
   ctx.web.api(`${base}/login/state`, async (_req: any, res: any) => {
-    const state = loginState(DATA_DIR);
+    const state = loginState(DATA_DIR, config.browserPath);
     // 唯一判据：CDP 能不能握手。PID、端口在听都会骗人，握手成功才算真的能用。
-    const cdp = await cdpAlive(LOGIN_PORT);
-    const listening = cdp ? true : await portOpenFn(LOGIN_PORT);
+    const cdp = await cdpAlive(config.loginPort);
+    const listening = cdp ? true : await portOpenFn(config.loginPort);
     sendJson(res, 200, {
       ok: true,
       open: cdp,
       portOpen: listening,
       pid: state.pid,
+      port: config.loginPort,
+      browser: state.browser,
       mode: state.mode,
       profile: state.profile,
     });
   });
 
   ctx.web.api(`${base}/login/open`, async (_req: any, res: any) => {
-    const result = await openLoginWindow(DATA_DIR, LOGIN_PORT, 'https://www.douyin.com/', config.windowMode);
+    const result = await openLoginWindow(DATA_DIR, config.loginPort, 'https://www.douyin.com/', config.windowMode, config.browserPath);
     // 归属标记由 browser.ts 在新窗口就绪后写入，这里不再重复写。
-    const cdp = await cdpAlive(LOGIN_PORT);
+    const cdp = await cdpAlive(config.loginPort);
     sendJson(res, 200, { ok: result.ok, message: result.message, open: cdp || result.ok, portOpen: cdp });
   });
 
   ctx.web.api(`${base}/login/close`, async (_req: any, res: any) => {
-    const result = await closeLoginWindow(DATA_DIR, LOGIN_PORT);
+    const result = await closeLoginWindow(DATA_DIR, config.loginPort);
     // 关完重新实测调试端口：拒绝关闭或退出未确认时窗口仍在，open 必须反映真实状态，不能硬编码 false。
-    const cdp = await cdpAlive(LOGIN_PORT);
+    const cdp = await cdpAlive(config.loginPort);
     sendJson(res, 200, { ok: result.ok, message: result.message, open: cdp, portOpen: cdp });
   });
 
   ctx.web.api(`${base}/login/import`, async (_req: any, res: any) => {
     try {
-      const cookies = await readCookies(LOGIN_PORT, loginToken(DATA_DIR) ?? undefined);
+      const cookies = await readCookies(config.loginPort, loginToken(DATA_DIR) ?? undefined);
       if (!cookies.ok || !cookies.cookie) {
         sendJson(res, 200, { ok: false, loggedIn: false, message: cookies.message ?? '读取 Cookie 失败。' });
         return;
@@ -1453,8 +1481,8 @@ document.getElementById('i').onsubmit=async e=>{e.preventDefault();const t=e.tar
         return;
       }
       let opened = false;
-      if (openWindow && (await cdpAlive(LOGIN_PORT))) {
-        const cdp = await connectCdp(LOGIN_PORT);
+      if (openWindow && (await cdpAlive(config.loginPort))) {
+        const cdp = await connectCdp(config.loginPort);
         if (cdp) {
           try {
             await cdp.send('Page.navigate', { url: first.url });
@@ -1463,7 +1491,7 @@ document.getElementById('i').onsubmit=async e=>{e.preventDefault();const t=e.tar
           cdp.close();
         }
       }
-      sendJson(res, 200, { ok: true, item: first, opened, windowAlive: await cdpAlive(LOGIN_PORT) });
+      sendJson(res, 200, { ok: true, item: first, opened, windowAlive: await cdpAlive(config.loginPort) });
     } catch (error: any) {
       sendJson(res, 200, { ok: false, message: String(error?.message ?? error).slice(0, 160) });
     }
@@ -1486,7 +1514,7 @@ document.getElementById('i').onsubmit=async e=>{e.preventDefault();const t=e.tar
       if (at) {
         const ts = Date.parse(at.replace(/-/g, '/'));
         if (!Number.isFinite(ts)) {
-          sendJson(res, 200, { ok: false, message: '时间看不懂，用 2026-11-19 21:30 这种格式。' });
+          sendJson(res, 200, { ok: false, message: '时间看不懂，用「YYYY-MM-DD HH:mm」这种格式，例如 2030-01-01 09:30。' });
           return;
         }
         if (ts <= Date.now() + 30000) {
@@ -1512,8 +1540,8 @@ document.getElementById('i').onsubmit=async e=>{e.preventDefault();const t=e.tar
 
   ctx.web.api(`${base}/creator/open`, async (_req: any, res: any) => {
     const url = 'https://creator.douyin.com/creator-micro/content/upload';
-    if (!(await cdpAlive(LOGIN_PORT))) {
-      const opened = await openLoginWindow(DATA_DIR, LOGIN_PORT, url, config.windowMode);
+    if (!(await cdpAlive(config.loginPort))) {
+      const opened = await openLoginWindow(DATA_DIR, config.loginPort, url, config.windowMode, config.browserPath);
       sendJson(res, 200, { ok: opened.ok, message: opened.message });
       return;
     }
@@ -1522,7 +1550,7 @@ document.getElementById('i').onsubmit=async e=>{e.preventDefault();const t=e.tar
       sendJson(res, 200, { ok: false, message: owned.message });
       return;
     }
-    const cdp = await connectCdp(LOGIN_PORT);
+    const cdp = await connectCdp(config.loginPort);
     if (!cdp) {
       sendJson(res, 200, { ok: false, message: '登录窗口在，但连不上它的调试端口。' });
       return;
@@ -1563,7 +1591,7 @@ document.getElementById('i').onsubmit=async e=>{e.preventDefault();const t=e.tar
   ctx.web.api(`${base}/auto-publish/state`, async (_req: any, res: any) => {
     const st = await readAutoPub();
     const comfy = await comfyReady();
-    const studio = studioInstalled();
+    const studio = Boolean(studioService());
     sendJson(res, 200, {
       ok: true,
       enabled: config.autoPublishEnabled,
@@ -1661,13 +1689,13 @@ document.getElementById('i').onsubmit=async e=>{e.preventDefault();const t=e.tar
       const list = (((result as any).items ?? []) as any[]).slice(0, config.autoFeedCount);
       let opened = 0;
       let note = '';
-      if (config.autoFeedOpenWindow && (await cdpAlive(LOGIN_PORT))) {
+      if (config.autoFeedOpenWindow && (await cdpAlive(config.loginPort))) {
         if (config.autoFeedScroll) {
-          const swipe = await swipeRecommend({ port: LOGIN_PORT, count: list.length || config.autoFeedCount, dwellMs: 4000 });
+          const swipe = await swipeRecommend({ port: config.loginPort, count: list.length || config.autoFeedCount, dwellMs: 4000 });
           opened = swipe.switched;
           note = swipe.message;
         } else {
-          const cdp = await connectCdp(LOGIN_PORT);
+          const cdp = await connectCdp(config.loginPort);
           if (cdp) {
             try {
               for (const item of list) {
@@ -1780,7 +1808,15 @@ document.getElementById('i').onsubmit=async e=>{e.preventDefault();const t=e.tar
     }
   };
 
-  const studioInstalled = () => existsSync(join(import.meta.dirname, '..', '..', '..', 'studio'));
+  // 画室不是本插件的依赖：只在宿主真的提供了 studio 服务时才认，认不到就是未接入，
+  // 不按固定目录结构去猜别的插件装没装。
+  const studioService = () => {
+    try {
+      return (ctx.get as any)('studio', false) ?? null;
+    } catch {
+      return null;
+    }
+  };
 
   const randomGap = () => {
     const min = Math.min(config.autoPublishRandomMin, config.autoPublishRandomMax);
@@ -1820,19 +1856,19 @@ document.getElementById('i').onsubmit=async e=>{e.preventDefault();const t=e.tar
         const card = await renderTextCard({
           text: desc,
           outDir: join(DATA_DIR, 'generated', 'textcards'),
-          title: '今日随笔',
+          title: config.textCardTitle.trim() || undefined,
         });
         if (!card.ok) return { ok: false, code: 'card_failed', message: card.message };
         images = [card.path];
         kind = 'text';
       }
-      if (!(await cdpAlive(LOGIN_PORT))) {
-        await openLoginWindow(DATA_DIR, LOGIN_PORT, 'https://creator.douyin.com/creator-micro/content/upload', config.windowMode).catch(() => null);
-        for (let i = 0; i < 25 && !(await cdpAlive(LOGIN_PORT)); i += 1) await new Promise((r) => setTimeout(r, 1000));
+      if (!(await cdpAlive(config.loginPort))) {
+        await openLoginWindow(DATA_DIR, config.loginPort, 'https://creator.douyin.com/creator-micro/content/upload', config.windowMode, config.browserPath).catch(() => null);
+        for (let i = 0; i < 25 && !(await cdpAlive(config.loginPort)); i += 1) await new Promise((r) => setTimeout(r, 1000));
       }
       const owned = await ensureOwnedWindow();
       if (!owned.ok) return { ok: false, code: 'window_not_owned', message: owned.message };
-      const result = await publishImages(LOGIN_PORT, { images, desc });
+      const result = await publishImages(config.loginPort, { images, desc });
       return { ok: Boolean(result.ok), message: result.message, kind, desc, images };
     } finally {
       autoPublishRunning.value = false;

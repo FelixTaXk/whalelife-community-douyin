@@ -12,13 +12,26 @@ const CANDIDATES = [
   join(process.env.LOCALAPPDATA ?? '', 'Google\\Chrome\\Application\\chrome.exe'),
   join(process.env.ProgramFiles ?? '', 'Microsoft\\Edge\\Application\\msedge.exe'),
   'C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe',
+  '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome',
+  '/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge',
+  '/Applications/Chromium.app/Contents/MacOS/Chromium',
 ];
 
-export function findBrowser(): string | null {
+/** 找浏览器：优先用设置页里填的路径，填了但不存在就如实报错，不再偷偷换成别的浏览器。 */
+export function findBrowser(preferred?: string): string | null {
+  const custom = String(preferred ?? '').trim();
+  if (custom) return existsSync(custom) ? custom : null;
   for (const path of CANDIDATES) {
     if (path && existsSync(path)) return path;
   }
   return null;
+}
+
+/** 设置页填了路径却找不到文件时的提示语，没有填就返回空。 */
+export function browserPathError(preferred?: string): string {
+  const custom = String(preferred ?? '').trim();
+  if (!custom || existsSync(custom)) return '';
+  return `设置页填的浏览器路径不存在：${custom}`;
 }
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
@@ -64,7 +77,7 @@ function ensureToken(dir: string): string {
   return token;
 }
 
-export function loginState(dir: string): LoginState {
+export function loginState(dir: string, preferredBrowser?: string): LoginState {
   let stored: any = null;
   try {
     stored = JSON.parse(readFileSync(stateFile(dir), 'utf8'));
@@ -82,7 +95,7 @@ export function loginState(dir: string): LoginState {
       open = false;
     }
   }
-  return { open, pid: open ? pid : null, port: open ? port : null, profile: stored?.profile ?? null, browser: findBrowser(), mode: stored?.mode ?? null };
+  return { open, pid: open ? pid : null, port: open ? port : null, profile: stored?.profile ?? null, browser: findBrowser(preferredBrowser), mode: stored?.mode ?? null };
 }
 
 export async function storageReady(port: number): Promise<boolean> {
@@ -321,20 +334,30 @@ export async function openLoginWindow(
   port: number,
   url: string,
   mode: WindowMode = 'visible',
+  browserPath = '',
 ): Promise<{ ok: boolean; fresh: boolean; message?: string; state?: LoginState }> {
   // 端口被占用时，先核实归属；核实不过就拒绝，不补标记、不读取登录信息。
   if (await cdpAlive(port)) {
     const check = await verifySession(dir, port);
-    if (check.owned) return { ok: true, fresh: false, message: '登录窗口已经开着，不用重复打开。', state: loginState(dir) };
+    if (check.owned) return { ok: true, fresh: false, message: '登录窗口已经开着，不用重复打开。', state: loginState(dir, browserPath) };
     return {
       ok: false,
       fresh: false,
       message: `检测到调试端口上有一个无法核实归属的浏览器实例（${check.reason ?? '标记对不上'}）。请先点「关闭登录窗口」，再重新打开专用窗口。`,
-      state: loginState(dir),
+      state: loginState(dir, browserPath),
     };
   }
-  const browser = findBrowser();
-  if (!browser) return { ok: false, fresh: false, message: '没找到 Chrome 或 Edge，无法自动打开登录窗口。' };
+  const browser = findBrowser(browserPath);
+  if (!browser) {
+    const custom = String(browserPath ?? '').trim();
+    return {
+      ok: false,
+      fresh: false,
+      message: custom
+        ? `${browserPathError(custom)}；改成正确的浏览器路径，或留空自动探测。`
+        : '没找到 Chrome 或 Edge：在设置页「本机连接」里填一下浏览器路径，或留空让它自动探测。',
+    };
+  }
   const profile = join(dir, 'browser-profile');
   mkdirSync(profile, { recursive: true });
   const sessionToken = ensureToken(dir);
@@ -363,8 +386,8 @@ export async function openLoginWindow(
     // 新窗口由本插件启动，归属天然成立；就绪后把标记写进它的 localStorage，供后续归属核对。
     await writeSessionMark(port, sessionToken);
     const label = mode === 'headless' ? '无界面' : mode === 'offscreen' ? '隐藏' : '可见';
-    if (!ready) return { ok: true, fresh: true, message: `登录窗口已打开（${label}模式）；调试端口还在启动，等你登录完再点读取。`, state: loginState(dir) };
-    return { ok: true, fresh: true, message: `登录窗口已打开（${label}模式），在里面登录抖音即可。`, state: loginState(dir) };
+    if (!ready) return { ok: true, fresh: true, message: `登录窗口已打开（${label}模式）；调试端口还在启动，等你登录完再点读取。`, state: loginState(dir, browserPath) };
+    return { ok: true, fresh: true, message: `登录窗口已打开（${label}模式），在里面登录抖音即可。`, state: loginState(dir, browserPath) };
   } catch (error: any) {
     return { ok: false, fresh: false, message: `打开浏览器失败：${String(error?.message ?? error).slice(0, 160)}` };
   }
