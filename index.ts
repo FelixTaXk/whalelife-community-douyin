@@ -1335,10 +1335,9 @@ document.getElementById('i').onsubmit=async e=>{e.preventDefault();const t=e.tar
 
   ctx.web.api(`${base}/login/open`, async (_req: any, res: any) => {
     const result = await openLoginWindow(DATA_DIR, LOGIN_PORT, 'https://www.douyin.com/', config.windowMode);
-    const cdp = await cdpAlive(LOGIN_PORT);
-    // 把会话归属标记写进专用窗口，之后读 Cookie 才有据可依。
     const token = loginToken(DATA_DIR);
-    if (result.ok && token && cdp) {
+    // 只有本插件刚启动的新窗口才写归属标记；已核实复用的窗口标记已在，归属未确认的一律不写。
+    if (result.ok && token && result.fresh) {
       const conn = await connectCdp(LOGIN_PORT);
       if (conn) {
         try {
@@ -1347,6 +1346,7 @@ document.getElementById('i').onsubmit=async e=>{e.preventDefault();const t=e.tar
         conn.close();
       }
     }
+    const cdp = await cdpAlive(LOGIN_PORT);
     sendJson(res, 200, { ok: result.ok, message: result.message, open: cdp || result.ok, portOpen: cdp });
   });
 

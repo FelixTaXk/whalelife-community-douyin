@@ -127,20 +127,75 @@ export async function cdpAlive(port: number): Promise<boolean> {
 
 export type WindowMode = 'visible' | 'offscreen' | 'headless';
 
+// 核实一个已在监听的窗口是否属于本插件：login.json 里的标记必须能在该窗口的 localStorage 对上。
+// 对不上、没有标记或读不到页面，一律视为归属未确认，不写标记、不读登录信息。
+export async function verifySession(dir: string, port: number): Promise<{ owned: boolean; reason?: string }> {
+  if (!(await cdpAlive(port))) return { owned: false, reason: '调试端口没响应。' };
+  const token = loginToken(dir);
+  if (!token) return { owned: false, reason: '没有会话标记，无法确认归属。' };
+  let targets: any[] = [];
+  try {
+    targets = await (await fetch(`http://127.0.0.1:${port}/json/list`)).json();
+  } catch {
+    return { owned: false, reason: '读不到浏览器页面。' };
+  }
+  const page = targets.find((t) => t?.type === 'page' && t?.webSocketDebuggerUrl) ?? targets.find((t) => t?.webSocketDebuggerUrl);
+  if (!page) return { owned: false, reason: '浏览器里没有可核实的页面。' };
+  const ws = new WebSocket(page.webSocketDebuggerUrl);
+  const got = await new Promise<string>((resolve) => {
+    let settled = false;
+    const done = (value: string) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      try {
+        ws.close();
+      } catch {}
+      resolve(value);
+    };
+    const timer = setTimeout(() => done(''), 6000);
+    ws.addEventListener('open', () => {
+      ws.send(
+        JSON.stringify({
+          id: 1,
+          method: 'Runtime.evaluate',
+          params: { expression: 'localStorage.getItem("__dl_session")||""', returnByValue: true },
+        }),
+      );
+    });
+    ws.addEventListener('message', (event) => {
+      let message: any;
+      try {
+        message = JSON.parse(String(event.data));
+      } catch {
+        return;
+      }
+      if (message.id === 1) done(String(message?.result?.result?.value ?? ''));
+    });
+    ws.addEventListener('error', () => done(''));
+  });
+  return got === token ? { owned: true } : { owned: false, reason: '窗口里的会话标记对不上，无法确认是插件启动的专用窗口。' };
+}
+
 export async function openLoginWindow(
   dir: string,
   port: number,
   url: string,
   mode: WindowMode = 'visible',
-): Promise<{ ok: boolean; message?: string; state?: LoginState }> {
-  // 只认一件事：调试端口能不能握手。PID 探活会被系统复用骗到，端口在听也可能是僵尸实例。
+): Promise<{ ok: boolean; fresh: boolean; message?: string; state?: LoginState }> {
+  // 端口被占用时，先核实归属；核实不过就拒绝，不补标记、不读取登录信息。
   if (await cdpAlive(port)) {
-    // 端口已被某个实例占着时，也补一个归属标记，避免把别人的浏览器当成自己的。
-    ensureToken(dir);
-    return { ok: true, message: '登录窗口已经开着，不用重复打开。', state: loginState(dir) };
+    const check = await verifySession(dir, port);
+    if (check.owned) return { ok: true, fresh: false, message: '登录窗口已经开着，不用重复打开。', state: loginState(dir) };
+    return {
+      ok: false,
+      fresh: false,
+      message: `检测到调试端口上有一个无法核实归属的浏览器实例（${check.reason ?? '标记对不上'}）。请先点「关闭登录窗口」，再重新打开专用窗口。`,
+      state: loginState(dir),
+    };
   }
   const browser = findBrowser();
-  if (!browser) return { ok: false, message: '没找到 Chrome 或 Edge，无法自动打开登录窗口。' };
+  if (!browser) return { ok: false, fresh: false, message: '没找到 Chrome 或 Edge，无法自动打开登录窗口。' };
   const profile = join(dir, 'browser-profile');
   mkdirSync(profile, { recursive: true });
   const sessionToken = ensureToken(dir);
@@ -167,10 +222,10 @@ export async function openLoginWindow(
     writeFileSync(stateFile(dir), JSON.stringify({ pid: child.pid, port, profile, mode, token: sessionToken, at: Date.now() }, null, 2), 'utf8');
     const ready = await Promise.race([storageReady(port), sleep(3000).then(() => false)]);
     const label = mode === 'headless' ? '无界面' : mode === 'offscreen' ? '隐藏' : '可见';
-    if (!ready) return { ok: true, message: `登录窗口已打开（${label}模式）；调试端口还在启动，等你登录完再点读取。`, state: loginState(dir) };
-    return { ok: true, message: `登录窗口已打开（${label}模式），在里面登录抖音即可。`, state: loginState(dir) };
+    if (!ready) return { ok: true, fresh: true, message: `登录窗口已打开（${label}模式）；调试端口还在启动，等你登录完再点读取。`, state: loginState(dir) };
+    return { ok: true, fresh: true, message: `登录窗口已打开（${label}模式），在里面登录抖音即可。`, state: loginState(dir) };
   } catch (error: any) {
-    return { ok: false, message: `打开浏览器失败：${String(error?.message ?? error).slice(0, 160)}` };
+    return { ok: false, fresh: false, message: `打开浏览器失败：${String(error?.message ?? error).slice(0, 160)}` };
   }
 }
 

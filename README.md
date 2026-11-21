@@ -10,7 +10,7 @@
 D:\AI\whalelife\plugins\surf\sub\douyin\
 ```
 
-依赖父插件 `surf`（已装）。`abogus`（MIT）装在本目录 `node_modules`，签名全在本机算，不走任何第三方服务。
+依赖父插件 `surf`（已装）。`abogus`（MIT）随发行包内置在本目录 `node_modules/abogus/`（含 `LICENSE`），全新实例点安装即可启用，无需预装依赖；签名全在本机算，不走任何第三方服务。
 
 ## 登录（设置页一键导出）
 
@@ -20,6 +20,8 @@ D:\AI\whalelife\plugins\surf\sub\douyin\
 2. 在弹出的窗口里登录抖音（扫码或手机号）。
 3. 回到设置页点「读取并保存 Cookie」——插件通过调试端口直接读回 `douyin.com` 的 Cookie，不用 F12。
 4. 显示「已登录」就点「关闭登录窗口」；以后登录过期，重复一遍即可。
+
+**会话归属核实**：只有插件自己启动、且能在该窗口 `localStorage` 对上随机会话标记的专用会话才会被采信；调试端口上已存在但归属无法核实的窗口，不会写入标记、也不会读取登录信息，页面会提示先关闭登录窗口再重新打开专用窗口。
 
 不想开窗口时，用「手动粘贴（备用）」：浏览器登录 `https://www.douyin.com/`，F12 控制台 `document.cookie` 复制整段贴进来，保存后点「检查登录」。
 
