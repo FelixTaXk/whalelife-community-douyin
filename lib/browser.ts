@@ -278,15 +278,19 @@ export async function openLoginWindow(
 
 export async function closeLoginWindow(dir: string, port: number): Promise<{ ok: boolean; message: string }> {
   const stored = loginState(dir);
-  // 关窗前重新核实归属：端口在听但标记对不上，不动这个进程，避免关掉别人的浏览器。
-  if (await cdpAlive(port)) {
-    const check = await verifySession(dir, port);
-    if (!check.owned) {
-      return {
-        ok: false,
-        message: `调试端口上的窗口无法确认属于当前实例（${check.reason ?? '标记对不上'}），未关闭。请手动关闭该窗口，或重新打开专用窗口后再关闭。`,
-      };
-    }
+  // 只有能核实归属的窗口才关闭；端口失联或标记对不上时，保留进程并提示，不按旧 PID 强杀。
+  if (!(await cdpAlive(port))) {
+    return {
+      ok: false,
+      message: '调试端口无响应，无法确认这个进程仍属于当前实例，未关闭。请在任务管理器手动确认后关闭，或重新打开专用窗口。',
+    };
+  }
+  const check = await verifySession(dir, port);
+  if (!check.owned) {
+    return {
+      ok: false,
+      message: `调试端口上的窗口无法确认属于当前实例（${check.reason ?? '标记对不上'}），未关闭。请手动关闭该窗口，或重新打开专用窗口后再关闭。`,
+    };
   }
   let killed = false;
   if (stored.pid) {
@@ -299,7 +303,7 @@ export async function closeLoginWindow(dir: string, port: number): Promise<{ ok:
   try {
     rmSync(stateFile(dir), { force: true });
   } catch {}
-  return { ok: true, message: killed ? '登录窗口已关闭。' : '没有正在运行的登录窗口。' };
+  return { ok: true, message: killed ? '登录窗口已关闭。' : '登录窗口已关闭（未记录到进程 PID）。' };
 }
 
 type CookieRow = { name: string; value: string; domain: string; path: string; expires: number; secure?: boolean; httpOnly?: boolean };

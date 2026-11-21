@@ -1269,8 +1269,16 @@ document.getElementById('saveAp').onclick=async()=>{const j=await postJson('conf
 document.getElementById('runAp').onclick=async()=>{const m=document.getElementById('apMsg');m.textContent='正在发布（约 20-60 秒，不要关页面）…';try{const j=await postJson('auto-publish/run');m.textContent=(j.ok?'成功：':'失败：')+(j.message||'')+(j.kind?(' ｜ 类型 '+j.kind):'');refreshAp();}catch(e){m.textContent='请求失败：'+(e&&e.message||e);}};
 const refreshQueue=async()=>{try{const j=await stateGet('${base}/queue?_='+Date.now());const its=(j&&j.items)||[];const pend=its.filter(x=>x.status==='pending');document.getElementById('queueList').textContent=pend.length?('待发布：'+pend.map(x=>new Date(x.at).toLocaleString('zh-CN')+' · '+String(x.desc).slice(0,20)).join(' / ')):'没有待发布的定时任务。';}catch(e){}};
 refreshQueue();
-const refreshAuto=async()=>{try{const j=await stateGet('${base}/auto/state?_='+Date.now());const rounds=(j.rounds||[]);const last=rounds[0];document.getElementById('autoLog').textContent=j.enabled?('自动刷已开：每 '+j.minutes+' 分钟刷 '+j.count+' 条'+(j.scroll?'（窗口内连续滑）':'（逐条打开）')+(j.nextAt?'，下次 '+(new Date(j.nextAt)).toLocaleString('zh-CN'):'')+(last?('；上一轮 '+((last.items&&last.items.length)||0)+' 条'+(last.interacted?('，赞藏 '+last.interacted.filter(x=>x.ok&&x.action==='like').length+' 次'):'')):'')):'自动刷未开启。';
-const pl=document.getElementById('personaLine');if(pl){pl.textContent=j.interact?(((j.personaWords||[]).length)?('人设关键词 '+(j.personaWords||[]).length+' 个：'+(j.personaWords||[]).join('、')):'人设关键词还没填，填了才会开始点赞'):'自动赞藏未开启。';}catch(e){}};
+const refreshAuto=async()=>{
+  try{
+    const j=await stateGet('${base}/auto/state?_='+Date.now());
+    const rounds=(j.rounds||[]);
+    const last=rounds[0];
+    document.getElementById('autoLog').textContent=j.enabled?('自动刷已开：每 '+j.minutes+' 分钟刷 '+j.count+' 条'+(j.scroll?'（窗口内连续滑）':'（逐条打开）')+(j.nextAt?'，下次 '+(new Date(j.nextAt)).toLocaleString('zh-CN'):'')+(last?('；上一轮 '+((last.items&&last.items.length)||0)+' 条'+(last.interacted?('，赞藏 '+last.interacted.filter(x=>x.ok&&x.action==='like').length+' 次'):'')):'')):'自动刷未开启。';
+    const pl=document.getElementById('personaLine');
+    if(pl){pl.textContent=j.interact?(((j.personaWords||[]).length)?('人设关键词 '+(j.personaWords||[]).length+' 个：'+(j.personaWords||[]).join('、')):'人设关键词还没填，填了才会开始点赞'):'自动赞藏未开启。';}
+  }catch(e){}
+};
 refreshAuto();
 document.getElementById('saveAuto').onclick=async()=>{const j=await postJson('config',{config:{autoFeedEnabled:document.getElementById('autoOn').checked,autoFeedMinutes:Number(document.getElementById('autoMin').value),autoFeedCount:Number(document.getElementById('autoCount').value),autoFeedOpenWindow:document.getElementById('autoOpen').checked,autoFeedScroll:document.getElementById('autoScroll').checked,windowMode:document.getElementById('winMode').value,autoInteractEnabled:document.getElementById('autoLike').checked,autoInteractPersona:document.getElementById('autoPersona').value,autoInteractWhitelist:document.getElementById('autoWhite').value,autoInteractMinShare:Number(document.getElementById('autoShare').value),autoInteractMaxPerRound:Number(document.getElementById('autoMax').value)}});document.getElementById('autoMsg').textContent=j.ok?'已保存（窗口模式改完要关掉窗口再重开才生效）。':'保存失败：'+(j.error||'');refreshAuto();};
 document.getElementById('runAuto').onclick=async()=>{const m=document.getElementById('autoMsg');m.textContent='正在跑一轮…';try{const j=await postJson('auto/run');if(j.ok){const its=(j.round&&j.round.items)||[];m.textContent='刷了 '+its.length+' 条：'+its.map(x=>String(x.desc).slice(0,12)).join(' / ');}else{m.textContent='失败：'+(j.message||'未知');}refreshAuto();}catch(e){m.textContent='请求失败：'+(e&&e.message||e);}};
