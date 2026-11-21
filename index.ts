@@ -5,7 +5,7 @@ import { join } from 'node:path';
 import { existsSync } from 'node:fs';
 import { createApi, cookieHeader, isLoggedIn, type Account } from './lib/api.ts';
 import { coverUrl, download, pickPlayUrl } from './lib/media.ts';
-import { closeLoginWindow, cdpAlive, loginState, loginToken, openLoginWindow, portOpen as portOpenFn, readCookies } from './lib/browser.ts';
+import { closeLoginWindow, cdpAlive, loginState, loginToken, openLoginWindow, portOpen as portOpenFn, readCookies, verifySession } from './lib/browser.ts';
 import { publishImages, connectCdp } from './lib/creator.ts';
 import { comfyGenerate } from './lib/comfy.ts';
 import { renderTextCard } from './lib/textcard.ts';
@@ -254,12 +254,21 @@ export async function apply(ctx: Context) {
     await ctx.config.save('publish-queue.json', { items: items.slice(-50) });
   };
 
+  // 复用登录导入的归属检查：窗口必须是本插件启动且会话标记对得上，否则不往它里面发任何操作。
+  const ensureOwnedWindow = async (): Promise<{ ok: boolean; message: string }> => {
+    if (!(await cdpAlive(LOGIN_PORT))) return { ok: false, message: '登录窗口没开。请先点「打开登录窗口」。' };
+    const check = await verifySession(DATA_DIR, LOGIN_PORT);
+    if (check.owned) return { ok: true, message: '' };
+    return { ok: false, message: `该窗口无法确认属于当前实例（${check.reason ?? '会话标记对不上'}）。请先点「关闭登录窗口」，再重新打开专用窗口。` };
+  };
+
   const runPublish = async (input: { desc: string; images?: string[]; comfyPrompt?: string }) => {
     if (!config.publishEnabled) {
       return { ok: false as const, code: 'publish_disabled', message: '发布开关没开。先在设置页勾上「允许发布」。' };
     }
-    if (!(await cdpAlive(LOGIN_PORT))) {
-      return { ok: false as const, code: 'no_window', message: '登录窗口没开。发布要用那个已登录创作者中心的窗口。' };
+    const owned = await ensureOwnedWindow();
+    if (!owned.ok) {
+      return { ok: false as const, code: 'window_not_owned', message: owned.message };
     }
     let images = Array.isArray(input.images) ? input.images.slice(0, 9) : [];
     if (!images.length && input.comfyPrompt) {
@@ -287,6 +296,16 @@ export async function apply(ctx: Context) {
     if (!(await cdpAlive(LOGIN_PORT))) {
       await openLoginWindow(DATA_DIR, LOGIN_PORT, 'https://creator.douyin.com/creator-micro/content/upload', config.windowMode).catch(() => null);
       for (let i = 0; i < 20 && !(await cdpAlive(LOGIN_PORT)); i += 1) await new Promise((r) => setTimeout(r, 1000));
+    }
+    const owned = await ensureOwnedWindow();
+    if (!owned.ok) {
+      for (const item of due) {
+        item.status = 'failed';
+        item.message = owned.message;
+      }
+      await saveQueue(items);
+      ctx.logger.warn('抖音定时发布', { reason: 'window_not_owned', message: owned.message });
+      return;
     }
     for (const item of due) {
       const result = await publishImages(LOGIN_PORT, { images: item.images, desc: item.desc });
@@ -1219,6 +1238,8 @@ ol.steps{margin:0;padding-left:20px;font-size:13px;color:var(--muted);line-heigh
 <script>
 const out=document.getElementById('out');
 const post=async(url,body)=>{const r=await fetch(url,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body||{})});out.textContent=await r.text();};
+// 状态查询也走 POST：后端 web.api 路由只注册 POST，用 GET 会 404。
+const stateGet=async(url)=>{const r=await fetch(url,{method:'POST',headers:{'Content-Type':'application/json'},body:'{}',cache:'no-store'});return r.json();};
 document.getElementById('c').onsubmit=async e=>{e.preventDefault();await post('${base}/cookie',{cookie:e.target.cookie.value});};
 document.getElementById('clear').onclick=()=>post('${base}/cookie/clear');
 document.getElementById('verify').onclick=()=>post('${base}/verify');
@@ -1227,7 +1248,7 @@ const msgEl=document.getElementById('loginMsg');
 const say=(t,ok)=>{msgEl.textContent=t;msgEl.style.color=ok?'#1f7a4d':'#9a3030';};
 const setBadge=(on)=>{const b=document.getElementById('badge');if(b){b.textContent=on?'已登录':'未登录';b.style.color=on?'#1f7a4d':'#9a3030';}};
 const callLogin=async(name)=>{say('处理中…',true);try{const r=await fetch('${base}/login/'+name+'?_='+Date.now(),{method:'POST',headers:{'Content-Type':'application/json'},body:'{}',cache:'no-store'});const j=await r.json();say((j.message||(j.ok?'完成。':'失败。'))+(j.count?(' · 读到 '+j.count+' 个 Cookie'):''),j.ok!==false);if(name==='import'&&j.loggedIn)setBadge(true);refreshLogin();return j;}catch(e){say('请求失败：'+(e&&e.message||e),false);}};
-const refreshLogin=async()=>{try{const r=await fetch('${base}/login/state?_='+Date.now(),{cache:'no-store'});const j=await r.json();const mn={visible:'可见',offscreen:'隐藏',headless:'无界面'};const label=j.open?('已打开（'+((j.mode&&mn[j.mode])||'可用')+'）'):(j.portOpen?'端口在听但连不上，关掉重开一次':'未打开');stateEl.textContent='窗口状态：'+label;}catch(e){stateEl.textContent='窗口状态：读取失败，刷新页面重试';}};
+const refreshLogin=async()=>{try{const j=await stateGet('${base}/login/state?_='+Date.now());const mn={visible:'可见',offscreen:'隐藏',headless:'无界面'};const label=j.open?('已打开（'+((j.mode&&mn[j.mode])||'可用')+'）'):(j.portOpen?'端口在听但连不上，关掉重开一次':'未打开');stateEl.textContent='窗口状态：'+label;}catch(e){stateEl.textContent='窗口状态：读取失败，刷新页面重试';}};
 refreshLogin(); setInterval(refreshLogin,5000);
 document.getElementById('open').onclick=()=>callLogin('open');
 document.getElementById('import').onclick=()=>callLogin('import');
@@ -1242,13 +1263,13 @@ document.getElementById('savePub').onclick=async()=>{const j=await postJson('con
 const apMode=document.getElementById('apMode');
 const syncApMode=()=>{const fixed=apMode.value==='fixed';document.getElementById('apFixed').style.display=fixed?'block':'none';document.getElementById('apRandom').style.display=fixed?'none':'block';};
 apMode.onchange=syncApMode;syncApMode();
-const refreshAp=async()=>{try{const r=await fetch('${base}/auto-publish/state?_='+Date.now(),{cache:'no-store'});const j=await r.json();const ld=(j.log||[])[0];document.getElementById('apLog').textContent=['发布开关 '+(j.publishEnabled?'开':'关'),'ComfyUI '+(j.comfy?'已连接':'未连接'),'画室 '+(j.studio?'已安装':'未安装'),'workflow '+(j.workflow?'已配':'未配'),'今日 '+j.dayCount+'/'+j.dailyMax,(j.mode==='fixed'?('固定 '+((j.slots||[]).join(' ')||'未设置')):('随机 '+j.randomMin+'-'+j.randomMax+' 分钟')),j.nextAt?('下次 '+(new Date(j.nextAt)).toLocaleString('zh-CN')):'',ld?('上一条 '+(ld.ok?'成功':'失败')+' '+String(ld.desc||ld.message||'').slice(0,40)):''].filter(Boolean).join(' ｜ ');}catch(e){}};
+const refreshAp=async()=>{try{const j=await stateGet('${base}/auto-publish/state?_='+Date.now());const ld=(j.log||[])[0];document.getElementById('apLog').textContent=['发布开关 '+(j.publishEnabled?'开':'关'),'ComfyUI '+(j.comfy?'已连接':'未连接'),'画室 '+(j.studio?'已安装':'未安装'),'workflow '+(j.workflow?'已配':'未配'),'今日 '+j.dayCount+'/'+j.dailyMax,(j.mode==='fixed'?('固定 '+((j.slots||[]).join(' ')||'未设置')):('随机 '+j.randomMin+'-'+j.randomMax+' 分钟')),j.nextAt?('下次 '+(new Date(j.nextAt)).toLocaleString('zh-CN')):'',ld?('上一条 '+(ld.ok?'成功':'失败')+' '+String(ld.desc||ld.message||'').slice(0,40)):''].filter(Boolean).join(' ｜ ');}catch(e){}};
 refreshAp(); setInterval(refreshAp,15000);
 document.getElementById('saveAp').onclick=async()=>{const j=await postJson('config',{config:{autoPublishEnabled:document.getElementById('apOn').checked,autoPublishMode:apMode.value,autoPublishTimes:document.getElementById('apTimes').value.trim(),autoPublishRandomMin:Number(document.getElementById('apMin').value),autoPublishRandomMax:Number(document.getElementById('apMax').value),autoPublishDailyMax:Number(document.getElementById('apDaily').value),autoPublishKind:document.getElementById('apKind').value,autoPublishCaptions:document.getElementById('apCaptions').value,autoPublishPrompts:document.getElementById('apPrompts').value}});document.getElementById('apMsg').textContent=j.ok?'已保存。':'保存失败：'+(j.error||'');refreshAp();};
 document.getElementById('runAp').onclick=async()=>{const m=document.getElementById('apMsg');m.textContent='正在发布（约 20-60 秒，不要关页面）…';try{const j=await postJson('auto-publish/run');m.textContent=(j.ok?'成功：':'失败：')+(j.message||'')+(j.kind?(' ｜ 类型 '+j.kind):'');refreshAp();}catch(e){m.textContent='请求失败：'+(e&&e.message||e);}};
-const refreshQueue=async()=>{try{const r=await fetch('${base}/queue?_='+Date.now(),{cache:'no-store'});const j=await r.json();const its=(j&&j.items)||[];const pend=its.filter(x=>x.status==='pending');document.getElementById('queueList').textContent=pend.length?('待发布：'+pend.map(x=>new Date(x.at).toLocaleString('zh-CN')+' · '+String(x.desc).slice(0,20)).join(' / ')):'没有待发布的定时任务。';}catch(e){}};
+const refreshQueue=async()=>{try{const j=await stateGet('${base}/queue?_='+Date.now());const its=(j&&j.items)||[];const pend=its.filter(x=>x.status==='pending');document.getElementById('queueList').textContent=pend.length?('待发布：'+pend.map(x=>new Date(x.at).toLocaleString('zh-CN')+' · '+String(x.desc).slice(0,20)).join(' / ')):'没有待发布的定时任务。';}catch(e){}};
 refreshQueue();
-const refreshAuto=async()=>{try{const r=await fetch('${base}/auto/state?_='+Date.now(),{cache:'no-store'});const j=await r.json();const rounds=(j.rounds||[]);const last=rounds[0];document.getElementById('autoLog').textContent=j.enabled?('自动刷已开：每 '+j.minutes+' 分钟刷 '+j.count+' 条'+(j.scroll?'（窗口内连续滑）':'（逐条打开）')+(j.nextAt?'，下次 '+(new Date(j.nextAt)).toLocaleString('zh-CN'):'')+(last?('；上一轮 '+((last.items&&last.items.length)||0)+' 条'+(last.interacted?('，赞藏 '+last.interacted.filter(x=>x.ok&&x.action==='like').length+' 次'):'')):'')):'自动刷未开启。';
+const refreshAuto=async()=>{try{const j=await stateGet('${base}/auto/state?_='+Date.now());const rounds=(j.rounds||[]);const last=rounds[0];document.getElementById('autoLog').textContent=j.enabled?('自动刷已开：每 '+j.minutes+' 分钟刷 '+j.count+' 条'+(j.scroll?'（窗口内连续滑）':'（逐条打开）')+(j.nextAt?'，下次 '+(new Date(j.nextAt)).toLocaleString('zh-CN'):'')+(last?('；上一轮 '+((last.items&&last.items.length)||0)+' 条'+(last.interacted?('，赞藏 '+last.interacted.filter(x=>x.ok&&x.action==='like').length+' 次'):'')):'')):'自动刷未开启。';
 const pl=document.getElementById('personaLine');if(pl){pl.textContent=j.interact?(((j.personaWords||[]).length)?('人设关键词 '+(j.personaWords||[]).length+' 个：'+(j.personaWords||[]).join('、')):'人设关键词还没填，填了才会开始点赞'):'自动赞藏未开启。';}catch(e){}};
 refreshAuto();
 document.getElementById('saveAuto').onclick=async()=>{const j=await postJson('config',{config:{autoFeedEnabled:document.getElementById('autoOn').checked,autoFeedMinutes:Number(document.getElementById('autoMin').value),autoFeedCount:Number(document.getElementById('autoCount').value),autoFeedOpenWindow:document.getElementById('autoOpen').checked,autoFeedScroll:document.getElementById('autoScroll').checked,windowMode:document.getElementById('winMode').value,autoInteractEnabled:document.getElementById('autoLike').checked,autoInteractPersona:document.getElementById('autoPersona').value,autoInteractWhitelist:document.getElementById('autoWhite').value,autoInteractMinShare:Number(document.getElementById('autoShare').value),autoInteractMaxPerRound:Number(document.getElementById('autoMax').value)}});document.getElementById('autoMsg').textContent=j.ok?'已保存（窗口模式改完要关掉窗口再重开才生效）。':'保存失败：'+(j.error||'');refreshAuto();};
@@ -1335,24 +1356,14 @@ document.getElementById('i').onsubmit=async e=>{e.preventDefault();const t=e.tar
 
   ctx.web.api(`${base}/login/open`, async (_req: any, res: any) => {
     const result = await openLoginWindow(DATA_DIR, LOGIN_PORT, 'https://www.douyin.com/', config.windowMode);
-    const token = loginToken(DATA_DIR);
-    // 只有本插件刚启动的新窗口才写归属标记；已核实复用的窗口标记已在，归属未确认的一律不写。
-    if (result.ok && token && result.fresh) {
-      const conn = await connectCdp(LOGIN_PORT);
-      if (conn) {
-        try {
-          await conn.evaluate(`localStorage.setItem("__dl_session",${JSON.stringify(token)})`);
-        } catch {}
-        conn.close();
-      }
-    }
+    // 归属标记由 browser.ts 在新窗口就绪后写入，这里不再重复写。
     const cdp = await cdpAlive(LOGIN_PORT);
     sendJson(res, 200, { ok: result.ok, message: result.message, open: cdp || result.ok, portOpen: cdp });
   });
 
   ctx.web.api(`${base}/login/close`, async (_req: any, res: any) => {
-    const result = closeLoginWindow(DATA_DIR);
-    sendJson(res, 200, { ok: true, message: result.message, open: false });
+    const result = await closeLoginWindow(DATA_DIR, LOGIN_PORT);
+    sendJson(res, 200, { ok: result.ok, message: result.message, open: false });
   });
 
   ctx.web.api(`${base}/login/import`, async (_req: any, res: any) => {
@@ -1494,6 +1505,11 @@ document.getElementById('i').onsubmit=async e=>{e.preventDefault();const t=e.tar
     if (!(await cdpAlive(LOGIN_PORT))) {
       const opened = await openLoginWindow(DATA_DIR, LOGIN_PORT, url, config.windowMode);
       sendJson(res, 200, { ok: opened.ok, message: opened.message });
+      return;
+    }
+    const owned = await ensureOwnedWindow();
+    if (!owned.ok) {
+      sendJson(res, 200, { ok: false, message: owned.message });
       return;
     }
     const cdp = await connectCdp(LOGIN_PORT);
@@ -1804,7 +1820,8 @@ document.getElementById('i').onsubmit=async e=>{e.preventDefault();const t=e.tar
         await openLoginWindow(DATA_DIR, LOGIN_PORT, 'https://creator.douyin.com/creator-micro/content/upload', config.windowMode).catch(() => null);
         for (let i = 0; i < 25 && !(await cdpAlive(LOGIN_PORT)); i += 1) await new Promise((r) => setTimeout(r, 1000));
       }
-      if (!(await cdpAlive(LOGIN_PORT))) return { ok: false, code: 'no_window', message: '登录窗口没起来，没法发布。' };
+      const owned = await ensureOwnedWindow();
+      if (!owned.ok) return { ok: false, code: 'window_not_owned', message: owned.message };
       const result = await publishImages(LOGIN_PORT, { images, desc });
       return { ok: Boolean(result.ok), message: result.message, kind, desc, images };
     } finally {

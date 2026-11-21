@@ -127,6 +127,51 @@ export async function cdpAlive(port: number): Promise<boolean> {
 
 export type WindowMode = 'visible' | 'offscreen' | 'headless';
 
+// 把归属标记写进指定窗口的 localStorage；仅对本插件刚启动的新窗口调用。
+async function writeSessionMark(port: number, token: string): Promise<void> {
+  let targets: any[] = [];
+  try {
+    targets = await (await fetch(`http://127.0.0.1:${port}/json/list`)).json();
+  } catch {
+    return;
+  }
+  const page = targets.find((t) => t?.type === 'page' && t?.webSocketDebuggerUrl) ?? targets.find((t) => t?.webSocketDebuggerUrl);
+  if (!page) return;
+  const ws = new WebSocket(page.webSocketDebuggerUrl);
+  await new Promise<void>((resolve) => {
+    let settled = false;
+    const done = () => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      try {
+        ws.close();
+      } catch {}
+      resolve();
+    };
+    const timer = setTimeout(done, 6000);
+    ws.addEventListener('open', () => {
+      ws.send(
+        JSON.stringify({
+          id: 1,
+          method: 'Runtime.evaluate',
+          params: { expression: `localStorage.setItem("__dl_session",${JSON.stringify(token)})`, returnByValue: true },
+        }),
+      );
+    });
+    ws.addEventListener('message', (event) => {
+      let message: any;
+      try {
+        message = JSON.parse(String(event.data));
+      } catch {
+        return;
+      }
+      if (message.id === 1) done();
+    });
+    ws.addEventListener('error', done);
+  });
+}
+
 // 核实一个已在监听的窗口是否属于本插件：login.json 里的标记必须能在该窗口的 localStorage 对上。
 // 对不上、没有标记或读不到页面，一律视为归属未确认，不写标记、不读登录信息。
 export async function verifySession(dir: string, port: number): Promise<{ owned: boolean; reason?: string }> {
@@ -221,6 +266,8 @@ export async function openLoginWindow(
     current = { pid: child.pid, port, profile };
     writeFileSync(stateFile(dir), JSON.stringify({ pid: child.pid, port, profile, mode, token: sessionToken, at: Date.now() }, null, 2), 'utf8');
     const ready = await Promise.race([storageReady(port), sleep(3000).then(() => false)]);
+    // 新窗口由本插件启动，归属天然成立；就绪后把标记写进它的 localStorage，供后续归属核对。
+    await writeSessionMark(port, sessionToken);
     const label = mode === 'headless' ? '无界面' : mode === 'offscreen' ? '隐藏' : '可见';
     if (!ready) return { ok: true, fresh: true, message: `登录窗口已打开（${label}模式）；调试端口还在启动，等你登录完再点读取。`, state: loginState(dir) };
     return { ok: true, fresh: true, message: `登录窗口已打开（${label}模式），在里面登录抖音即可。`, state: loginState(dir) };
@@ -229,8 +276,18 @@ export async function openLoginWindow(
   }
 }
 
-export function closeLoginWindow(dir: string): { ok: boolean; message: string } {
+export async function closeLoginWindow(dir: string, port: number): Promise<{ ok: boolean; message: string }> {
   const stored = loginState(dir);
+  // 关窗前重新核实归属：端口在听但标记对不上，不动这个进程，避免关掉别人的浏览器。
+  if (await cdpAlive(port)) {
+    const check = await verifySession(dir, port);
+    if (!check.owned) {
+      return {
+        ok: false,
+        message: `调试端口上的窗口无法确认属于当前实例（${check.reason ?? '标记对不上'}），未关闭。请手动关闭该窗口，或重新打开专用窗口后再关闭。`,
+      };
+    }
+  }
   let killed = false;
   if (stored.pid) {
     try {
