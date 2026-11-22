@@ -195,7 +195,11 @@ const CHALLENGE_JS = String.raw`(() => {
   const t = document.body ? document.body.innerText : '';
   const sms = /接收短信验证码|获取验证码|请输入验证码/.test(t);
   const captcha = /滑块验证|安全验证|请完成验证|拖动滑块/.test(t);
-  const frame = [...document.querySelectorAll('iframe')].some((f) => /rc-verifycenter|verifycenter|captcha/i.test(String(f.src || '')));
+  const frame = [...document.querySelectorAll('iframe')].some((f) => {
+    const r = f.getBoundingClientRect();
+    // 抖音页面上常驻一个 0×0 的 rc-verifycenter 空壳 iframe，只看 src 会天天误报「挂着滑块」。
+    return r.width > 120 && r.height > 60 && /rc-verifycenter|verifycenter|captcha/i.test(String(f.src || ''));
+  });
   return sms || captcha || frame ? (sms ? 'sms' : 'captcha') : '';
 })()`;
 

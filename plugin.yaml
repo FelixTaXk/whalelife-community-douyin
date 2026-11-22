@@ -1,6 +1,6 @@
 id: douyin
 name: 抖音
-version: 0.3.0
+version: 0.4.0
 description: 刷推荐流、搜索、看视频片段（画面与声音）、读评论、点赞收藏评论关注；需导入网页 Cookie。
 apiVersion: "1.0.0"
 depends: [surf]

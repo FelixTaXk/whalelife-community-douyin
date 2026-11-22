@@ -7,6 +7,7 @@ import { coverUrl, download, pickPlayUrl } from './lib/media.ts';
 import { closeLoginWindow, cdpAlive, loginState, loginToken, openLoginWindow, portOpen as portOpenFn, readCookies, verifySession } from './lib/browser.ts';
 import { publishImages, publishVideo, listMyWorks, pageChallenge, connectCdp } from './lib/creator.ts';
 import { readWorkComments, replyToWorkComment, replyKey, type PageComment } from './lib/reply.ts';
+import { listConversations, readConversation, sendDirectMessage, probeInbox } from './lib/im.ts';
 import { comfyGenerate } from './lib/comfy.ts';
 import { renderTextCard } from './lib/textcard.ts';
 import { swipeRecommend } from './lib/swipe.ts';
@@ -46,6 +47,8 @@ type Config = {
   autoReplyTemplates: string;
   autoReplyPerHour: number;
   autoReplyWorks: number;
+  allowDm: boolean;
+  dmPerHour: number;
   autoPublishEnabled: boolean;
   autoPublishMode: 'fixed' | 'random';
   autoPublishTimes: string;
@@ -94,6 +97,9 @@ const DEFAULTS: Config = {
   autoReplyTemplates: '',
   autoReplyPerHour: 2,
   autoReplyWorks: 2,
+  // 私信：默认关，且只手动发、不自动回。
+  allowDm: false,
+  dmPerHour: 5,
   autoPublishEnabled: false,
   autoPublishMode: 'fixed',
   autoPublishTimes: '09:00,20:00',
@@ -228,6 +234,8 @@ export async function apply(ctx: Context) {
       autoReplyTemplates: String(stored.autoReplyTemplates ?? DEFAULTS.autoReplyTemplates).slice(0, 2000),
       autoReplyPerHour: num(stored.autoReplyPerHour, DEFAULTS.autoReplyPerHour, 1, 10),
       autoReplyWorks: num(stored.autoReplyWorks, DEFAULTS.autoReplyWorks, 1, 5),
+      allowDm: bool(stored.allowDm, DEFAULTS.allowDm),
+      dmPerHour: num(stored.dmPerHour, DEFAULTS.dmPerHour, 1, 20),
       autoPublishEnabled: bool(stored.autoPublishEnabled, DEFAULTS.autoPublishEnabled),
       autoPublishMode: (String(stored.autoPublishMode) === 'random' ? 'random' : 'fixed') as Config['autoPublishMode'],
       autoPublishTimes: String(stored.autoPublishTimes ?? DEFAULTS.autoPublishTimes).slice(0, 200),
@@ -313,6 +321,21 @@ export async function apply(ctx: Context) {
       .split(/\r?\n/)
       .map((x) => x.trim())
       .filter(Boolean);
+
+  // 私信配额：只限手动发送，不做自动回复。
+  type DmState = { hourAt: number; hourCount: number };
+  const readDmState = async (): Promise<DmState> => {
+    const stored = ((await ctx.config.read('dm-state.json').catch(() => null)) ?? {}) as any;
+    return { hourAt: Number(stored?.hourAt ?? 0), hourCount: Number(stored?.hourCount ?? 0) };
+  };
+  const saveDmState = async (state: DmState) => {
+    await ctx.config.save('dm-state.json', state).catch(() => {});
+  };
+  const dmQuota = async () => {
+    const state = await readDmState();
+    const fresh = Date.now() - state.hourAt > 3600_000;
+    return { state, used: fresh ? 0 : state.hourCount, remaining: Math.max(0, config.dmPerHour - (fresh ? 0 : state.hourCount)) };
+  };
 
   const fillTemplate = (tpl: string, comment: PageComment) =>
     tpl.replace(/\{author\}/g, comment.author || '你').replace(/\{content\}/g, (comment.content || '').slice(0, 12));
@@ -1063,6 +1086,110 @@ export async function apply(ctx: Context) {
   });
 
   ctx.tools.registerTransient({
+    name: 'douyin_inbox',
+    danger: 'safe',
+    schema: shape({}, []),
+    description: '读抖音私信会话列表（在登录窗口里点开私信面板读取，只读不点会话）：返回会话下标、对方昵称、最后一条预览。要求登录窗口开着且已登录。',
+    async run(): Promise<any> {
+      const owned = await ensureOwnedWindow();
+      if (!owned.ok) {
+        return {
+          content: { status: 'error', error: { code: 'window_not_owned', message: owned.message } },
+          receipt: { action: 'douyin_inbox', status: 'error', code: 'window_not_owned' },
+        };
+      }
+      const result = await listConversations(config.loginPort);
+      if (!result.ok) {
+        return {
+          content: { status: 'error', error: { code: 'inbox_failed', message: result.message ?? '读会话列表失败。' } },
+          receipt: { action: 'douyin_inbox', status: 'error', code: 'inbox_failed' },
+        };
+      }
+      return {
+        content: { status: 'ok', untrusted: true, count: result.items?.length ?? 0, items: result.items },
+        receipt: { action: 'douyin_inbox', status: 'ok', count: result.items?.length ?? 0 },
+      };
+    },
+  });
+
+  ctx.tools.registerTransient({
+    name: 'douyin_dm_read',
+    danger: 'safe',
+    schema: shape({ name: text, index: { type: 'integer', minimum: 0, maximum: 200 } }, []),
+    description: '读某个抖音私信会话的最近消息：name 给对方昵称（模糊匹配），或 index 给会话下标（先用 douyin_inbox 查）。返回每条是对方发的还是自己发的。',
+    async run(args: any): Promise<any> {
+      const owned = await ensureOwnedWindow();
+      if (!owned.ok) {
+        return {
+          content: { status: 'error', error: { code: 'window_not_owned', message: owned.message } },
+          receipt: { action: 'douyin_dm_read', status: 'error', code: 'window_not_owned' },
+        };
+      }
+      const result = await readConversation(config.loginPort, {
+        name: String(args?.name ?? '').trim() || undefined,
+        index: args?.index === undefined ? undefined : Number(args.index),
+      });
+      if (!result.ok) {
+        return {
+          content: { status: 'error', error: { code: 'dm_read_failed', message: result.message ?? '读会话失败。' } },
+          receipt: { action: 'douyin_dm_read', status: 'error', code: 'dm_read_failed' },
+        };
+      }
+      return {
+        content: { status: 'ok', untrusted: true, with: result.with, count: result.items?.length ?? 0, items: result.items },
+        receipt: { action: 'douyin_dm_read', status: 'ok', count: result.items?.length ?? 0 },
+      };
+    },
+  });
+
+  ctx.tools.registerTransient({
+    name: 'douyin_dm_send',
+    danger: 'full',
+    schema: shape({ name: text, index: { type: 'integer', minimum: 0, maximum: 200 }, text }, ['text']),
+    description:
+      '给某个抖音会话发一条私信：name 给对方昵称（模糊匹配），或 index 给会话下标；text 是内容（最长 500 字）。' +
+      '只在已有会话里发，不主动新建会话；发送后回读最后一条确认是自己发的。要求设置页打开「允许发私信」并开着登录窗口，且受每小时条数限制。',
+    async run(args: any): Promise<any> {
+      if (!config.allowDm) {
+        return {
+          content: { status: 'error', error: { code: 'dm_disabled', message: '「允许发私信」开关没开，先到设置页打开。' } },
+          receipt: { action: 'douyin_dm_send', status: 'error', code: 'dm_disabled' },
+        };
+      }
+      const owned = await ensureOwnedWindow();
+      if (!owned.ok) {
+        return {
+          content: { status: 'error', error: { code: 'window_not_owned', message: owned.message } },
+          receipt: { action: 'douyin_dm_send', status: 'error', code: 'window_not_owned' },
+        };
+      }
+      const quota = await dmQuota();
+      if (!quota.remaining) {
+        return {
+          content: { status: 'error', error: { code: 'dm_rate_limited', message: `这一小时已经发了 ${config.dmPerHour} 条，先停一停。` } },
+          receipt: { action: 'douyin_dm_send', status: 'error', code: 'dm_rate_limited' },
+        };
+      }
+      const result = await sendDirectMessage(
+        config.loginPort,
+        { name: String(args?.name ?? '').trim() || undefined, index: args?.index === undefined ? undefined : Number(args.index) },
+        String(args?.text ?? ''),
+      );
+      if (!result.ok) {
+        return {
+          content: { status: 'error', error: { code: result.code ?? 'dm_failed', message: result.message } },
+          receipt: { action: 'douyin_dm_send', status: 'error', code: result.code ?? 'dm_failed' },
+        };
+      }
+      await saveDmState({ hourAt: quota.used ? quota.state.hourAt : Date.now(), hourCount: quota.used + 1 });
+      return {
+        content: { status: 'ok', message: result.message, with: result.with, verified: Boolean(result.verified), remaining: quota.remaining - 1 },
+        receipt: { action: 'douyin_dm_send', status: 'ok', with: result.with ?? '' },
+      };
+    },
+  });
+
+  ctx.tools.registerTransient({
     name: 'douyin_binge',
     danger: 'safe',
     schema: shape(
@@ -1364,6 +1491,17 @@ ol.steps{margin:0;padding-left:20px;font-size:13px;color:var(--muted);line-heigh
 </section>
 
 <section class="card">
+  <h2>私信</h2>
+  <p class="note">在登录窗口里点开私信面板读会话、读消息、发私信；只在已有会话里发，不主动新建会话。发之前要求登录窗口已登录，页面挂着验证码会直接拒绝。先用「检测私信页」确认面板打得开。</p>
+  <div class="grid">
+    <label>每小时最多发几条<input type="number" id="dPerHour" min="1" max="20" value="${cfg.dmPerHour}"></label>
+  </div>
+  <label class="note" style="margin-top:8px;display:block"><input type="checkbox" id="dAllow" ${cfg.allowDm ? 'checked' : ''}> 允许发私信（工具 douyin_dm_send 才会动）</label>
+  <div class="row"><button class="primary" type="button" id="saveDm">保存私信设置</button><button type="button" id="probeDm">检测私信页</button><button type="button" id="listDm">读会话列表</button></div>
+  <p class="note" id="dmMsg"></p>
+</section>
+
+<section class="card">
   <h2>手动粘贴（备用）</h2>
   <p class="note">不想让插件开窗口时，自己在浏览器登录 douyin.com，F12 控制台输入 <code>document.cookie</code> 复制整段粘进来。${account?.cookie ? '已保存一段，留空表示不改。' : '现在还没有配置。'}<br>Cookie 只存本机 <code>data/account.json</code>，不会写进日志或回执。</p>
   <form id="c">
@@ -1517,6 +1655,9 @@ document.getElementById('close').onclick=()=>callLogin('close');
 document.getElementById('saveLocal').onclick=async()=>{try{const j=await postJson('config',{config:{loginPort:Number(document.getElementById('lPort').value),browserPath:document.getElementById('lBrowser').value.trim(),textCardTitle:document.getElementById('cardTitle').value.trim()}});document.getElementById('localMsg').textContent=j.ok?'已保存。端口或浏览器路径改过的话，关掉登录窗口再重开才生效。':'保存失败：'+(j.error||'');refreshLogin();}catch(e){document.getElementById('localMsg').textContent='保存失败：'+(e&&e.message||e);}};
 document.getElementById('saveReply').onclick=async()=>{try{const j=await postJson('config',{config:{autoReplyEnabled:document.getElementById('rAuto').checked,autoReplyTemplates:document.getElementById('rTpl').value,autoReplyPerHour:Number(document.getElementById('rPerHour').value),autoReplyWorks:Number(document.getElementById('rWorks').value)}});document.getElementById('replyMsg').textContent=j.ok?'回评论设置已保存。':'保存失败：'+(j.error||'');refreshReply();}catch(e){document.getElementById('replyMsg').textContent='保存失败：'+(e&&e.message||e);}};
 document.getElementById('replyNow').onclick=async()=>{const el=document.getElementById('replyMsg');el.textContent='正在看最近几条作品的评论…（每条约 10~20 秒）';try{const j=await postJson('reply/run',{});el.textContent=j.ok||j.message?((j.ok?'':'没回：')+(j.message||'')):'没有结果';refreshReply();}catch(e){el.textContent='请求失败：'+(e&&e.message||e);}};
+document.getElementById('saveDm').onclick=async()=>{const el=document.getElementById('dmMsg');try{const j=await postJson('config',{config:{allowDm:document.getElementById('dAllow').checked,dmPerHour:Number(document.getElementById('dPerHour').value)}});el.textContent=j.ok?'私信设置已保存。':'保存失败：'+(j.error||'');}catch(e){el.textContent='保存失败：'+(e&&e.message||e);}};
+document.getElementById('probeDm').onclick=async()=>{const el=document.getElementById('dmMsg');el.textContent='正在打开私信面板…';try{const j=await postJson('dm/probe',{});el.textContent=j.message||'';}catch(e){el.textContent='请求失败：'+(e&&e.message||e);}};
+document.getElementById('listDm').onclick=async()=>{const el=document.getElementById('dmMsg');el.textContent='正在读会话列表…';try{const j=await postJson('dm/list',{});if(!j.ok){el.textContent='读失败：'+(j.message||'');return;}const its=j.items||[];el.textContent=its.length?('会话：'+its.map(x=>'#'+x.index+' '+x.name).join(' / ')):'一个会话都没有。';}catch(e){el.textContent='请求失败：'+(e&&e.message||e);}};
 const postJson=async(path,body)=>{const r=await fetch('${base}/'+path+'?_='+Date.now(),{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body||{}),cache:'no-store'});return r.json();};
 const nowMsg=document.getElementById('nowMsg');
 document.getElementById('nowFeed').onclick=async()=>{nowMsg.textContent='正在刷…';try{const j=await postJson('now/feed');if(!j.ok){nowMsg.textContent='没刷到：'+(j.message||'失败');return;}const it=j.item||{};nowMsg.textContent='刷到：'+(it.desc||'（无文案）')+' ｜ 作者 '+((it.author&&it.author.nickname)||'?')+' ｜ 点赞 '+((it.stats&&it.stats.digg)!=null?it.stats.digg:'?')+(j.opened?' ｜ 已在窗口打开':(j.windowAlive?' ｜ 窗口开着但没跳转':' ｜ 登录窗口没开，只拉了一条数据'));}catch(e){nowMsg.textContent='请求失败：'+(e&&e.message||e);}};
@@ -1602,6 +1743,8 @@ document.getElementById('i').onsubmit=async e=>{e.preventDefault();const t=e.tar
         autoReplyTemplates: patch.autoReplyTemplates === undefined ? current.autoReplyTemplates : String(patch.autoReplyTemplates || '').slice(0, 2000),
         autoReplyPerHour: patch.autoReplyPerHour === undefined ? current.autoReplyPerHour : num(patch.autoReplyPerHour, current.autoReplyPerHour, 1, 10),
         autoReplyWorks: patch.autoReplyWorks === undefined ? current.autoReplyWorks : num(patch.autoReplyWorks, current.autoReplyWorks, 1, 5),
+        allowDm: patch.allowDm === undefined ? current.allowDm : bool(patch.allowDm, current.allowDm),
+        dmPerHour: patch.dmPerHour === undefined ? current.dmPerHour : num(patch.dmPerHour, current.dmPerHour, 1, 20),
         autoPublishEnabled: patch.autoPublishEnabled === undefined ? current.autoPublishEnabled : bool(patch.autoPublishEnabled, current.autoPublishEnabled),
         autoPublishMode: (String(patch.autoPublishMode) === 'random' ? 'random' : patch.autoPublishMode === 'fixed' ? 'fixed' : current.autoPublishMode) as Config['autoPublishMode'],
         autoPublishTimes: patch.autoPublishTimes === undefined ? current.autoPublishTimes : String(patch.autoPublishTimes || '').slice(0, 200),
@@ -1872,6 +2015,34 @@ document.getElementById('i').onsubmit=async e=>{e.preventDefault();const t=e.tar
   ctx.web.api(`${base}/queue`, async (_req: any, res: any) => {
     const items = await readQueue();
     sendJson(res, 200, { ok: true, items });
+  });
+
+  ctx.web.api(`${base}/dm/probe`, async (_req: any, res: any) => {
+    try {
+      const owned = await ensureOwnedWindow();
+      if (!owned.ok) {
+        sendJson(res, 200, { ok: false, message: owned.message });
+        return;
+      }
+      const result = await probeInbox(config.loginPort);
+      sendJson(res, 200, result);
+    } catch (error: any) {
+      sendJson(res, 200, { ok: false, message: String(error?.message ?? error).slice(0, 200) });
+    }
+  });
+
+  ctx.web.api(`${base}/dm/list`, async (_req: any, res: any) => {
+    try {
+      const owned = await ensureOwnedWindow();
+      if (!owned.ok) {
+        sendJson(res, 200, { ok: false, message: owned.message });
+        return;
+      }
+      const result = await listConversations(config.loginPort);
+      sendJson(res, 200, result);
+    } catch (error: any) {
+      sendJson(res, 200, { ok: false, message: String(error?.message ?? error).slice(0, 200) });
+    }
   });
 
   ctx.web.api(`${base}/reply/state`, async (_req: any, res: any) => {
@@ -2253,5 +2424,5 @@ document.getElementById('i').onsubmit=async e=>{e.preventDefault();const t=e.tar
     cache.clear();
   });
 
-  ctx.logger.info('抖音插件已加载：douyin_status / douyin_feed / douyin_search / douyin_view / douyin_comments / douyin_user / douyin_works / douyin_binge / douyin_interact / douyin_now / douyin_publish / douyin_reply');
+  ctx.logger.info('抖音插件已加载：douyin_status / douyin_feed / douyin_search / douyin_view / douyin_comments / douyin_user / douyin_works / douyin_binge / douyin_interact / douyin_now / douyin_publish / douyin_reply / douyin_inbox / douyin_dm_read / douyin_dm_send');
 }
