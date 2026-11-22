@@ -4,7 +4,7 @@ import type { Context } from 'whalelife';
 import { join } from 'node:path';
 import { createApi, cookieHeader, isLoggedIn, type Account } from './lib/api.ts';
 import { coverUrl, download, pickPlayUrl } from './lib/media.ts';
-import { closeLoginWindow, cdpAlive, hideLoginWindow, loginState, loginToken, openLoginWindow, portOpen as portOpenFn, readCookies, showLoginWindow, verifySession } from './lib/browser.ts';
+import { closeLoginWindow, closeSpawnedLoginWindow, cdpAlive, hideLoginWindow, loginState, loginToken, openLoginWindow, portOpen as portOpenFn, readCookies, showLoginWindow, verifySession } from './lib/browser.ts';
 import { publishImages, publishVideo, listMyWorks, pageChallenge, connectCdp } from './lib/creator.ts';
 import { readWorkComments, replyToWorkComment, replyKey, type PageComment } from './lib/reply.ts';
 import { listConversations, readConversation, sendDirectMessage, probeInbox } from './lib/im.ts';
@@ -2106,9 +2106,9 @@ document.getElementById('i').onsubmit=async e=>{e.preventDefault();const t=e.tar
   // 启动时读一次配置，失败就用默认值。
   config = await readConfig().catch(() => ({ ...DEFAULTS }));
 
-  // 停用或卸载时释放自己起的登录浏览器，别把进程留在后台占着调试端口。
+  // 停用或卸载时收掉本插件自己起的登录浏览器：只杀自己 spawn 的 PID，不碰归属不明的窗口。
   ctx.signal.addEventListener('abort', () => {
-    void closeLoginWindow(DATA_DIR, config.loginPort).catch(() => {});
+    closeSpawnedLoginWindow(DATA_DIR);
   }, { once: true });
 
   type AutoRound = {

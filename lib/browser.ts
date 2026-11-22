@@ -498,6 +498,23 @@ export async function openLoginWindow(
   }
 }
 
+/**
+ * 停用/卸载时的同步收尾：只杀本进程自己 spawn 出来的窗口，PID 可信，不按状态文件里的旧 PID 强杀。
+ * 插件卸下后没有事件循环可用，所以这里必须是同步的。
+ */
+export function closeSpawnedLoginWindow(dir: string): boolean {
+  const pid = current?.pid;
+  current = null;
+  if (!pid) return false;
+  try {
+    process.kill(pid);
+  } catch {}
+  try {
+    rmSync(stateFile(dir), { force: true });
+  } catch {}
+  return true;
+}
+
 export async function closeLoginWindow(dir: string, port: number): Promise<{ ok: boolean; message: string; open: boolean }> {
   const stored = loginState(dir);
 
