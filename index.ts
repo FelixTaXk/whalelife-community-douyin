@@ -1666,7 +1666,7 @@ document.getElementById('probeDm').onclick=async()=>{const el=document.getElemen
 document.getElementById('listDm').onclick=async()=>{const el=document.getElementById('dmMsg');el.textContent='正在读会话列表…';try{const j=await postJson('dm/list',{});if(!j.ok){el.textContent='读失败：'+(j.message||'');return;}const its=j.items||[];el.textContent=its.length?('会话：'+its.map(x=>'#'+x.index+' '+x.name).join(' / ')):'一个会话都没有。';}catch(e){el.textContent='请求失败：'+(e&&e.message||e);}};
 const postJson=async(path,body)=>{const r=await fetch('${base}/'+path+'?_='+Date.now(),{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body||{}),cache:'no-store'});return r.json();};
 const nowMsg=document.getElementById('nowMsg');
-document.getElementById('nowFeed').onclick=async()=>{nowMsg.textContent='正在刷…';try{const j=await postJson('now/feed');if(!j.ok){nowMsg.textContent='没刷到：'+(j.message||'失败');return;}const it=j.item||{};nowMsg.textContent='刷到：'+(it.desc||'（无文案）')+' ｜ 作者 '+((it.author&&it.author.nickname)||'?')+' ｜ 点赞 '+((it.stats&&it.stats.digg)!=null?it.stats.digg:'?')+(j.opened?' ｜ 已在窗口打开':(j.windowAlive?' ｜ 窗口开着但没跳转':' ｜ 登录窗口没开，只拉了一条数据'));}catch(e){nowMsg.textContent='请求失败：'+(e&&e.message||e);}};
+document.getElementById('nowFeed').onclick=async()=>{nowMsg.textContent='正在刷…';try{const j=await postJson('now/feed');if(!j.ok){nowMsg.textContent='没刷到：'+(j.message||'失败');return;}const it=j.item||{};nowMsg.textContent='刷到：'+(it.desc||'（无文案）')+' ｜ 作者 '+((it.author&&it.author.nickname)||'?')+' ｜ 点赞 '+((it.stats&&it.stats.digg)!=null?it.stats.digg:'?')+(j.skipped?(' ｜ 跳过 '+j.skipped+' 条失效视频'):'')+(j.opened?' ｜ 已在窗口打开':(j.windowAlive?' ｜ 窗口开着但没跳转':' ｜ 登录窗口没开，只拉了一条数据'));}catch(e){nowMsg.textContent='请求失败：'+(e&&e.message||e);}};
 document.getElementById('nowPost').onclick=()=>{const box=document.getElementById('postBox');box.style.display=box.style.display==='none'?'block':'none';};
 document.getElementById('openCreator').onclick=async()=>{const j=await postJson('creator/open');nowMsg.textContent=j.message||'';};
 document.getElementById('pSend').onclick=async()=>{const hint=document.getElementById('pubHint');const desc=document.getElementById('pDesc').value.trim();const imgs=document.getElementById('pImgs').value.split(String.fromCharCode(10)).map(s=>s.trim()).filter(Boolean);const video=document.getElementById('pVideo').value.trim();const comfyPrompt=document.getElementById('pPrompt').value.trim();const at=document.getElementById('pAt').value.trim();if(!desc){hint.textContent='先写作品描述';return;}hint.textContent='处理中…'+(video?'短视频要等转码，可能几分钟':'发布会在登录窗口里操作，约 20 秒');try{const j=await postJson('publish',{desc,images:imgs,video,comfyPrompt,at});hint.textContent=(j.ok?'成功：':'失败：')+(j.message||'');refreshQueue();}catch(e){hint.textContent='请求失败：'+(e&&e.message||e);}};
@@ -1888,28 +1888,45 @@ document.getElementById('i').onsubmit=async e=>{e.preventDefault();const t=e.tar
     try {
       const body = await readJson(req, context?.signal ?? ctx.signal).catch(() => ({}));
       const openWindow = body?.open === undefined ? true : Boolean(body.open);
-      const result = await requestFeed(1, 'all', ctx.signal);
+      // 推荐接口里会夹着已删除/私密作品，直接打开详情页会停在「你要观看的视频不存在」。
+      // 多取几条候选，逐条在窗口里验证能播，跳过失效的再返回。
+      const result = await requestFeed(6, 'all', ctx.signal);
       if (!result.ok) {
         sendJson(res, 200, { ok: false, code: result.code, message: result.message });
         return;
       }
-      const first = (result as any).items?.[0];
-      if (!first) {
+      const candidates = (((result as any).items ?? []) as any[]).filter((x) => x?.url);
+      if (!candidates.length) {
         sendJson(res, 200, { ok: false, message: '这次没刷到内容（平台返回空列表）。' });
         return;
       }
+      let first = candidates[0];
+      let skipped = 0;
       let opened = false;
       if (openWindow && (await cdpAlive(config.loginPort))) {
         const cdp = await connectCdp(config.loginPort);
         if (cdp) {
           try {
-            await cdp.send('Page.navigate', { url: first.url });
-            opened = true;
+            for (const item of candidates) {
+              await cdp.send('Page.navigate', { url: item.url });
+              await new Promise((r) => setTimeout(r, 2600));
+              const dead = await cdp.evaluate(`(() => {
+                const t = String(document.body ? document.body.innerText : '');
+                return /你要观看的视频不存在|视频不存在|页面不见啦/.test(t);
+              })()`);
+              if (dead) {
+                skipped += 1;
+                continue;
+              }
+              first = item;
+              opened = true;
+              break;
+            }
           } catch {}
           cdp.close();
         }
       }
-      sendJson(res, 200, { ok: true, item: first, opened, windowAlive: await cdpAlive(config.loginPort) });
+      sendJson(res, 200, { ok: true, item: first, skipped, opened, windowAlive: await cdpAlive(config.loginPort) });
     } catch (error: any) {
       sendJson(res, 200, { ok: false, message: String(error?.message ?? error).slice(0, 160) });
     }
