@@ -2106,6 +2106,11 @@ document.getElementById('i').onsubmit=async e=>{e.preventDefault();const t=e.tar
   // 启动时读一次配置，失败就用默认值。
   config = await readConfig().catch(() => ({ ...DEFAULTS }));
 
+  // 停用或卸载时释放自己起的登录浏览器，别把进程留在后台占着调试端口。
+  ctx.signal.addEventListener('abort', () => {
+    void closeLoginWindow(DATA_DIR, config.loginPort).catch(() => {});
+  }, { once: true });
+
   type AutoRound = {
     at: number;
     items: { awemeId: string; desc: string; author: string; digg: number }[];

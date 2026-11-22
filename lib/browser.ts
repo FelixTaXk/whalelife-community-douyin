@@ -501,6 +501,15 @@ export async function openLoginWindow(
 export async function closeLoginWindow(dir: string, port: number): Promise<{ ok: boolean; message: string; open: boolean }> {
   const stored = loginState(dir);
 
+  // 本来就没有窗口：如实回执「已经关着」，顺手清掉过期的状态文件，不再报归属不明。
+  if (!stored.open && !(await cdpAlive(port))) {
+    current = null;
+    try {
+      rmSync(stateFile(dir), { force: true });
+    } catch {}
+    return { ok: true, open: false, message: '登录窗口已经关着，不用再关。' };
+  }
+
   // 端口失联：无法确认归属，保留进程与会话记录，不报成功、不清记录。
   if (!(await cdpAlive(port))) {
     return {
