@@ -205,14 +205,23 @@ async function waitForExit(port: number, pid: number | null, timeoutMs: number):
 
 export type WindowMode = 'visible' | 'offscreen' | 'headless';
 
-/** 把绕过屏外的窗口拽回屏幕中间：窗口开着、但模式是 offscreen 时用。 */
-export async function showLoginWindow(dir: string, port: number): Promise<{ ok: boolean; message: string }> {
-  const state = loginState(dir);
-  if (!state.open) return { ok: false, message: '登录窗口没开着，点「打开登录窗口」就行。' };
-  if (state.mode === 'headless') {
-    return { ok: false, message: '当前是无界面模式，本来就没有窗口可显示：要看得见，请把设置页的窗口模式改成「可见」，关掉窗口再重开一次。' };
-  }
+/** 把 login.json 里的 mode 改成指定值，状态行和按钮文案才能跟着变。 */
+function markMode(dir: string, mode: WindowMode): void {
+  try {
+    const stored = JSON.parse(readFileSync(stateFile(dir), 'utf8'));
+    if (!stored || typeof stored !== 'object') return;
+    writeFileSync(stateFile(dir), JSON.stringify({ ...stored, mode }, null, 2), 'utf8');
+  } catch {}
+}
 
+// 通过已核实的 CDP 连接改窗口位置：显示=挪回屏幕，隐藏=挪出屏幕。
+async function moveLoginWindow(
+  dir: string,
+  port: number,
+  bounds: { left: number; top: number; width: number; height: number },
+  nextMode: WindowMode,
+  successMessage: string,
+): Promise<{ ok: boolean; message: string }> {
   let targets: any[] = [];
   try {
     targets = await (await fetch(`http://127.0.0.1:${port}/json/list`)).json();
@@ -233,7 +242,7 @@ export async function showLoginWindow(dir: string, port: number): Promise<{ ok: 
       } catch {}
       resolve(value);
     };
-    timers.push(setTimeout(() => done({ ok: false, message: '显示窗口超时，没等到浏览器回应。' }), 8000));
+    timers.push(setTimeout(() => done({ ok: false, message: '改窗口位置超时，没等到浏览器回应。' }), 8000));
 
     ws.addEventListener('open', () => {
       ws.send(JSON.stringify({ id: 1, method: 'Browser.getWindowForTarget', params: { targetId: page.id } }));
@@ -252,32 +261,45 @@ export async function showLoginWindow(dir: string, port: number): Promise<{ ok: 
       if (message.id === 1) {
         const windowId = message?.result?.windowId;
         if (!windowId) {
-          done({ ok: false, message: '拿不到窗口句柄，没法把窗口显示出来。' });
+          done({ ok: false, message: '拿不到窗口句柄，改不了窗口位置。' });
           return;
         }
         ws.send(JSON.stringify({
           id: 2,
           method: 'Browser.setWindowBounds',
-          params: { windowId, bounds: { left: 80, top: 60, width: 1280, height: 900, windowState: 'normal' } },
+          params: { windowId, bounds: { ...bounds, windowState: 'normal' } },
         }));
       } else if (message.id === 2) {
-        ws.send(JSON.stringify({ id: 3, method: 'Page.bringToFront', params: {} }));
+        if (nextMode === 'visible') ws.send(JSON.stringify({ id: 3, method: 'Page.bringToFront', params: {} }));
+        else {
+          markMode(dir, nextMode);
+          done({ ok: true, message: successMessage });
+        }
       } else if (message.id === 3) {
-        markModeVisible(dir);
-        done({ ok: true, message: '已把登录窗口从屏幕外拉回来。' });
+        markMode(dir, nextMode);
+        done({ ok: true, message: successMessage });
       }
     });
     ws.addEventListener('error', () => done({ ok: false, message: '连窗口时出错，先关掉窗口再重新打开。' }));
   });
 }
 
-/** 显示成功后把 login.json 里的 mode 改成 visible，状态行才不会再说「隐藏」。 */
-function markModeVisible(dir: string): void {
-  try {
-    const stored = JSON.parse(readFileSync(stateFile(dir), 'utf8'));
-    if (!stored || typeof stored !== 'object') return;
-    writeFileSync(stateFile(dir), JSON.stringify({ ...stored, mode: 'visible' }, null, 2), 'utf8');
-  } catch {}
+/** 把挪到屏幕外的窗口拽回屏幕中间：窗口开着、但模式是 offscreen 时用。 */
+export async function showLoginWindow(dir: string, port: number): Promise<{ ok: boolean; message: string }> {
+  const state = loginState(dir);
+  if (!state.open) return { ok: false, message: '登录窗口没开着，点「打开登录窗口」就行。' };
+  if (state.mode === 'headless') {
+    return { ok: false, message: '当前是无界面模式，本来就没有窗口可显示：要看得见，请把设置页的窗口模式改成「可见」，关掉窗口再重开一次。' };
+  }
+  return moveLoginWindow(dir, port, { left: 80, top: 60, width: 1280, height: 900 }, 'visible', '已把登录窗口从屏幕外拉回来。');
+}
+
+/** 把窗口挪出屏幕（隐藏模式），省得挡视线；聊天记录和登录态都不受影响。 */
+export async function hideLoginWindow(dir: string, port: number): Promise<{ ok: boolean; message: string }> {
+  const state = loginState(dir);
+  if (!state.open) return { ok: false, message: '登录窗口没开着。' };
+  if (state.mode === 'headless') return { ok: false, message: '当前是无界面模式，本来就没有窗口，不用隐藏。' };
+  return moveLoginWindow(dir, port, { left: -2400, top: -2400, width: 1280, height: 900 }, 'offscreen', '已把登录窗口移出屏幕外。');
 }
 
 // 把归属标记写入某个页面的 localStorage，写完读回校验，一致才算成功。

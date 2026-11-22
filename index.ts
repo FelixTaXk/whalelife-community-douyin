@@ -4,7 +4,7 @@ import type { Context } from 'whalelife';
 import { join } from 'node:path';
 import { createApi, cookieHeader, isLoggedIn, type Account } from './lib/api.ts';
 import { coverUrl, download, pickPlayUrl } from './lib/media.ts';
-import { closeLoginWindow, cdpAlive, loginState, loginToken, openLoginWindow, portOpen as portOpenFn, readCookies, showLoginWindow, verifySession } from './lib/browser.ts';
+import { closeLoginWindow, cdpAlive, hideLoginWindow, loginState, loginToken, openLoginWindow, portOpen as portOpenFn, readCookies, showLoginWindow, verifySession } from './lib/browser.ts';
 import { publishImages, publishVideo, listMyWorks, pageChallenge, connectCdp } from './lib/creator.ts';
 import { readWorkComments, replyToWorkComment, replyKey, type PageComment } from './lib/reply.ts';
 import { listConversations, readConversation, sendDirectMessage, probeInbox } from './lib/im.ts';
@@ -1646,12 +1646,16 @@ const stateEl=document.getElementById('loginState');
 const msgEl=document.getElementById('loginMsg');
 const say=(t,ok)=>{msgEl.textContent=t;msgEl.style.color=ok?'#1f7a4d':'#9a3030';};
 const setBadge=(on)=>{const b=document.getElementById('badge');if(b){b.textContent=on?'已登录':'未登录';b.style.color=on?'#1f7a4d':'#9a3030';}};
+let winMode='';
+const showBtn=document.getElementById('show');
+// 「显示窗口」按钮跟着当前状态变：窗口在屏幕上就是「隐藏窗口」，在屏幕外就是「显示窗口」，窗口没开就禁用。
+const syncShowBtn=(open,mode)=>{winMode=String(mode||'');const can=Boolean(open)&&winMode!=='headless';showBtn.textContent=winMode==='visible'?'隐藏窗口':'显示窗口';showBtn.disabled=!can;showBtn.title=can?'':(winMode==='headless'?'无界面模式没有窗口可显示或隐藏':'窗口没开着');};
 const callLogin=async(name)=>{say('处理中…',true);try{const r=await fetch('${base}/login/'+name+'?_='+Date.now(),{method:'POST',headers:{'Content-Type':'application/json'},body:'{}',cache:'no-store'});const j=await r.json();say((j.message||(j.ok?'完成。':'失败。'))+(j.count?(' · 读到 '+j.count+' 个 Cookie'):''),j.ok!==false);if(name==='import'&&j.loggedIn)setBadge(true);refreshLogin();return j;}catch(e){say('请求失败：'+(e&&e.message||e),false);}};
 const refreshReply=async()=>{try{const j=await postJson('reply/state',{});const el=document.getElementById('replyMsg');if(!el)return;const parts=[];parts.push('本轮剩余配额 '+(j.remaining??0)+' 条');if(j.lastRunAt)parts.push('上次回评 '+new Date(j.lastRunAt).toLocaleTimeString('zh-CN'));if(j.verifyUntil&&new Date(j.verifyUntil)>new Date())parts.push('验证码冷却到 '+new Date(j.verifyUntil).toLocaleTimeString('zh-CN'));if(j.repliedTotal)parts.push('累计已回 '+j.repliedTotal+' 条');el.textContent=parts.join(' ｜ ');}catch(e){}};
-const refreshLogin=async()=>{try{const j=await stateGet('${base}/login/state?_='+Date.now());const mn={visible:'可见',offscreen:'隐藏',headless:'无界面'};const label=j.open?('已打开（'+((j.mode&&mn[j.mode])||'可用')+'）'):(j.portOpen?'端口在听但连不上，关掉重开一次':'未打开');const br=j.browser?String(j.browser).split(/[\\\\/]/).pop():'没找到浏览器';const ch=j.challenge==='sms'?' ｜ 要短信验证':(j.challenge==='captcha'?' ｜ 挂着滑块/安全验证':'');stateEl.textContent='窗口状态：'+label+' ｜ 端口 '+(j.port||'?')+' ｜ 浏览器 '+br+ch;}catch(e){stateEl.textContent='窗口状态：读取失败，刷新页面重试';}};
+const refreshLogin=async()=>{try{const j=await stateGet('${base}/login/state?_='+Date.now());const mn={visible:'可见',offscreen:'隐藏',headless:'无界面'};const label=j.open?('已打开（'+((j.mode&&mn[j.mode])||'可用')+'）'):(j.portOpen?'端口在听但连不上，关掉重开一次':'未打开');const br=j.browser?String(j.browser).split(/[\\\\/]/).pop():'没找到浏览器';const ch=j.challenge==='sms'?' ｜ 要短信验证':(j.challenge==='captcha'?' ｜ 挂着滑块/安全验证':'');stateEl.textContent='窗口状态：'+label+' ｜ 端口 '+(j.port||'?')+' ｜ 浏览器 '+br+ch;syncShowBtn(j.open,j.mode);}catch(e){stateEl.textContent='窗口状态：读取失败，刷新页面重试';}};
 refreshLogin(); setInterval(refreshLogin,5000);
 document.getElementById('open').onclick=()=>callLogin('open');
-document.getElementById('show').onclick=()=>callLogin('show');
+document.getElementById('show').onclick=()=>callLogin(winMode==='visible'?'hide':'show');
 document.getElementById('import').onclick=()=>callLogin('import');
 document.getElementById('close').onclick=()=>callLogin('close');
 document.getElementById('saveLocal').onclick=async()=>{try{const j=await postJson('config',{config:{loginPort:Number(document.getElementById('lPort').value),browserPath:document.getElementById('lBrowser').value.trim(),textCardTitle:document.getElementById('cardTitle').value.trim()}});document.getElementById('localMsg').textContent=j.ok?'已保存。端口或浏览器路径改过的话，关掉登录窗口再重开才生效。':'保存失败：'+(j.error||'');refreshLogin();}catch(e){document.getElementById('localMsg').textContent='保存失败：'+(e&&e.message||e);}};
@@ -1794,6 +1798,16 @@ document.getElementById('i').onsubmit=async e=>{e.preventDefault();const t=e.tar
   ctx.web.api(`${base}/login/show`, async (_req: any, res: any) => {
     try {
       const result = await showLoginWindow(DATA_DIR, config.loginPort);
+      const cdp = await cdpAlive(config.loginPort);
+      sendJson(res, 200, { ok: result.ok, message: result.message, open: cdp, portOpen: cdp });
+    } catch (error: any) {
+      sendJson(res, 200, { ok: false, message: String(error?.message ?? error).slice(0, 200) });
+    }
+  });
+
+  ctx.web.api(`${base}/login/hide`, async (_req: any, res: any) => {
+    try {
+      const result = await hideLoginWindow(DATA_DIR, config.loginPort);
       const cdp = await cdpAlive(config.loginPort);
       sendJson(res, 200, { ok: result.ok, message: result.message, open: cdp, portOpen: cdp });
     } catch (error: any) {
