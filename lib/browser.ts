@@ -205,6 +205,81 @@ async function waitForExit(port: number, pid: number | null, timeoutMs: number):
 
 export type WindowMode = 'visible' | 'offscreen' | 'headless';
 
+/** 把绕过屏外的窗口拽回屏幕中间：窗口开着、但模式是 offscreen 时用。 */
+export async function showLoginWindow(dir: string, port: number): Promise<{ ok: boolean; message: string }> {
+  const state = loginState(dir);
+  if (!state.open) return { ok: false, message: '登录窗口没开着，点「打开登录窗口」就行。' };
+  if (state.mode === 'headless') {
+    return { ok: false, message: '当前是无界面模式，本来就没有窗口可显示：要看得见，请把设置页的窗口模式改成「可见」，关掉窗口再重开一次。' };
+  }
+
+  let targets: any[] = [];
+  try {
+    targets = await (await fetch(`http://127.0.0.1:${port}/json/list`)).json();
+  } catch {}
+  const page = targets.find((x: any) => x.type === 'page' && String(x.url).includes('douyin.com')) ?? targets.find((x: any) => x.type === 'page');
+  if (!page?.webSocketDebuggerUrl) return { ok: false, message: '连不上登录窗口里的页面，先点「关闭登录窗口」再重新打开。' };
+
+  const ws = new WebSocket(page.webSocketDebuggerUrl);
+  return await new Promise<{ ok: boolean; message: string }>((resolve) => {
+    let settled = false;
+    const timers: any[] = [];
+    const done = (value: { ok: boolean; message: string }) => {
+      if (settled) return;
+      settled = true;
+      for (const t of timers) clearTimeout(t);
+      try {
+        ws.close();
+      } catch {}
+      resolve(value);
+    };
+    timers.push(setTimeout(() => done({ ok: false, message: '显示窗口超时，没等到浏览器回应。' }), 8000));
+
+    ws.addEventListener('open', () => {
+      ws.send(JSON.stringify({ id: 1, method: 'Browser.getWindowForTarget', params: { targetId: page.id } }));
+    });
+    ws.addEventListener('message', (event) => {
+      let message: any;
+      try {
+        message = JSON.parse(String(event.data));
+      } catch {
+        return;
+      }
+      if (message.error) {
+        done({ ok: false, message: `浏览器不让改窗口位置：${message.error.message ?? '未知原因'}` });
+        return;
+      }
+      if (message.id === 1) {
+        const windowId = message?.result?.windowId;
+        if (!windowId) {
+          done({ ok: false, message: '拿不到窗口句柄，没法把窗口显示出来。' });
+          return;
+        }
+        ws.send(JSON.stringify({
+          id: 2,
+          method: 'Browser.setWindowBounds',
+          params: { windowId, bounds: { left: 80, top: 60, width: 1280, height: 900, windowState: 'normal' } },
+        }));
+      } else if (message.id === 2) {
+        ws.send(JSON.stringify({ id: 3, method: 'Page.bringToFront', params: {} }));
+      } else if (message.id === 3) {
+        markModeVisible(dir);
+        done({ ok: true, message: '已把登录窗口从屏幕外拉回来。' });
+      }
+    });
+    ws.addEventListener('error', () => done({ ok: false, message: '连窗口时出错，先关掉窗口再重新打开。' }));
+  });
+}
+
+/** 显示成功后把 login.json 里的 mode 改成 visible，状态行才不会再说「隐藏」。 */
+function markModeVisible(dir: string): void {
+  try {
+    const stored = JSON.parse(readFileSync(stateFile(dir), 'utf8'));
+    if (!stored || typeof stored !== 'object') return;
+    writeFileSync(stateFile(dir), JSON.stringify({ ...stored, mode: 'visible' }, null, 2), 'utf8');
+  } catch {}
+}
+
 // 把归属标记写入某个页面的 localStorage，写完读回校验，一致才算成功。
 async function writeMarkToPage(page: any, token: string): Promise<boolean> {
   const ws = new WebSocket(page.webSocketDebuggerUrl);
@@ -339,7 +414,15 @@ export async function openLoginWindow(
   // 端口被占用时，先核实归属；核实不过就拒绝，不补标记、不读取登录信息。
   if (await cdpAlive(port)) {
     const check = await verifySession(dir, port);
-    if (check.owned) return { ok: true, fresh: false, message: '登录窗口已经开着，不用重复打开。', state: loginState(dir, browserPath) };
+    if (check.owned) {
+      const st = loginState(dir, browserPath);
+      // 已经开着但窗口在屏幕外（隐藏模式）：直接把窗口拽回来，不让用户自己去猜。
+      if (st.mode === 'offscreen') {
+        const shown = await showLoginWindow(dir, port);
+        return { ok: shown.ok, fresh: false, message: shown.ok ? `${shown.message}窗口会回到屏幕上的常规大小。` : shown.message, state: loginState(dir, browserPath) };
+      }
+      return { ok: true, fresh: false, message: '登录窗口已经开着，不用重复打开。', state: st };
+    }
     return {
       ok: false,
       fresh: false,
