@@ -6,6 +6,7 @@ import { createApi, cookieHeader, isLoggedIn, type Account } from './lib/api.ts'
 import { coverUrl, download, pickPlayUrl } from './lib/media.ts';
 import { closeLoginWindow, cdpAlive, loginState, loginToken, openLoginWindow, portOpen as portOpenFn, readCookies, verifySession } from './lib/browser.ts';
 import { publishImages, publishVideo, listMyWorks, pageChallenge, connectCdp } from './lib/creator.ts';
+import { readWorkComments, replyToWorkComment, replyKey, type PageComment } from './lib/reply.ts';
 import { comfyGenerate } from './lib/comfy.ts';
 import { renderTextCard } from './lib/textcard.ts';
 import { swipeRecommend } from './lib/swipe.ts';
@@ -41,6 +42,10 @@ type Config = {
   loginPort: number;
   browserPath: string;
   textCardTitle: string;
+  autoReplyEnabled: boolean;
+  autoReplyTemplates: string;
+  autoReplyPerHour: number;
+  autoReplyWorks: number;
   autoPublishEnabled: boolean;
   autoPublishMode: 'fixed' | 'random';
   autoPublishTimes: string;
@@ -84,6 +89,11 @@ const DEFAULTS: Config = {
   browserPath: '',
   // 文字卡片标题：留空则不加标题（不预设任何个人文案）。
   textCardTitle: '',
+  // 回评论：默认关；要先打开「允许发表评论」，并且填了模板才会动。
+  autoReplyEnabled: false,
+  autoReplyTemplates: '',
+  autoReplyPerHour: 2,
+  autoReplyWorks: 2,
   autoPublishEnabled: false,
   autoPublishMode: 'fixed',
   autoPublishTimes: '09:00,20:00',
@@ -214,6 +224,10 @@ export async function apply(ctx: Context) {
       loginPort: num(stored.loginPort, DEFAULTS.loginPort, 1024, 65535),
       browserPath: String(stored.browserPath ?? DEFAULTS.browserPath).slice(0, 400),
       textCardTitle: String(stored.textCardTitle ?? DEFAULTS.textCardTitle).slice(0, 60),
+      autoReplyEnabled: bool(stored.autoReplyEnabled, DEFAULTS.autoReplyEnabled),
+      autoReplyTemplates: String(stored.autoReplyTemplates ?? DEFAULTS.autoReplyTemplates).slice(0, 2000),
+      autoReplyPerHour: num(stored.autoReplyPerHour, DEFAULTS.autoReplyPerHour, 1, 10),
+      autoReplyWorks: num(stored.autoReplyWorks, DEFAULTS.autoReplyWorks, 1, 5),
       autoPublishEnabled: bool(stored.autoPublishEnabled, DEFAULTS.autoPublishEnabled),
       autoPublishMode: (String(stored.autoPublishMode) === 'random' ? 'random' : 'fixed') as Config['autoPublishMode'],
       autoPublishTimes: String(stored.autoPublishTimes ?? DEFAULTS.autoPublishTimes).slice(0, 200),
@@ -264,6 +278,119 @@ export async function apply(ctx: Context) {
 
   const saveQueue = async (items: QueueItem[]) => {
     await ctx.config.save('publish-queue.json', { items: items.slice(-50) });
+  };
+
+  // ── 回评论状态 ──────────────────────────────────────────
+  type ReplyState = {
+    keys: Record<string, number>;
+    hourAt: number;
+    hourCount: number;
+    /** 撞到验证码后的冷却截止时间。 */
+    verifyUntil: number;
+    lastRunAt: number;
+  };
+
+  const readReplyState = async (): Promise<ReplyState> => {
+    const stored = ((await ctx.config.read('reply-state.json').catch(() => null)) ?? {}) as any;
+    const keys = stored?.keys && typeof stored.keys === 'object' ? stored.keys : {};
+    return {
+      keys: keys as Record<string, number>,
+      hourAt: Number(stored?.hourAt ?? 0),
+      hourCount: Number(stored?.hourCount ?? 0),
+      verifyUntil: Number(stored?.verifyUntil ?? 0),
+      lastRunAt: Number(stored?.lastRunAt ?? 0),
+    };
+  };
+
+  const saveReplyState = async (state: ReplyState) => {
+    // 只留最近 2000 条回复记录，避免文件越长越大。
+    const entries = Object.entries(state.keys).sort((a, b) => b[1] - a[1]).slice(0, 2000);
+    await ctx.config.save('reply-state.json', { ...state, keys: Object.fromEntries(entries) }).catch(() => {});
+  };
+
+  const replyTemplates = () =>
+    String(config.autoReplyTemplates ?? '')
+      .split(/\r?\n/)
+      .map((x) => x.trim())
+      .filter(Boolean);
+
+  const fillTemplate = (tpl: string, comment: PageComment) =>
+    tpl.replace(/\{author\}/g, comment.author || '你').replace(/\{content\}/g, (comment.content || '').slice(0, 12));
+
+  /** 自动回一轮：扫最近几条作品的新评论，按模板回，受每小时配额与验证码冷却限制。 */
+  const runAutoReply = async (): Promise<any> => {
+    if (!config.allowComment) return { ok: false, code: 'comment_disabled', message: '先打开「允许发表评论」，自动回评论才会动。' };
+    if (!config.autoReplyEnabled) return { ok: false, code: 'reply_disabled', message: '「自动回评论」开关没开。' };
+    const templates = replyTemplates();
+    if (!templates.length) return { ok: false, code: 'no_template', message: '回复模板是空的：先填几条，每行一条，可用 {author} 占位。' };
+    const owned = await ensureOwnedWindow();
+    if (!owned.ok) return { ok: false, code: 'window_not_owned', message: owned.message };
+
+    const state = await readReplyState();
+    const now = Date.now();
+    if (state.verifyUntil > now) {
+      const mins = Math.ceil((state.verifyUntil - now) / 60000);
+      return { ok: false, code: 'verify_cooldown', message: `上次操作撞到短信/滑块验证，还有 ${mins} 分钟不再尝试；去登录窗口里手动过一次可提前恢复。` };
+    }
+    if (now - state.hourAt > 3600_000) {
+      state.hourAt = now;
+      state.hourCount = 0;
+    }
+    const remain = Math.max(0, config.autoReplyPerHour - state.hourCount);
+
+    const works = await listMyWorks(config.loginPort, config.autoReplyWorks);
+    if (!works.ok) return { ok: false, code: 'works_failed', message: works.message ?? '读作品失败。' };
+    const workList = (works.items ?? []).slice(0, config.autoReplyWorks);
+    if (!workList.length) return { ok: false, code: 'no_works', message: '账号里没读到作品。' };
+
+    const scanned: { awemeId: string; comments: number; newOnes: number }[] = [];
+    const replied: { awemeId: string; author: string; content: string; text: string; ok: boolean; message: string }[] = [];
+    let stopped = '';
+    state.hourAt = state.hourAt || now;
+
+    for (const work of workList) {
+      if (replied.length >= remain) break;
+      const read = await readWorkComments(config.loginPort, work.id);
+      if (!read.ok) {
+        stopped = read.message ?? '读评论失败。';
+        break;
+      }
+      const comments = read.items ?? [];
+      const fresh = comments.filter((c) => {
+        if (c.isAuthor || !c.canReply || !c.content) return false;
+        const key = replyKey(work.id, c.cid, c.author, c.content);
+        return !state.keys[key];
+      });
+      scanned.push({ awemeId: work.id, comments: comments.length, newOnes: fresh.length });
+      for (const comment of fresh) {
+        if (replied.length >= remain) break;
+        const key = replyKey(work.id, comment.cid, comment.author, comment.content);
+        if (state.keys[key]) continue;
+        const text = fillTemplate(pickOne(templates), comment).slice(0, 100);
+        const result = await replyToWorkComment(config.loginPort, { awemeId: work.id, text, index: comment.index });
+        replied.push({ awemeId: work.id, author: comment.author, content: comment.content.slice(0, 40), text, ok: result.ok, message: result.message });
+        if (result.ok) {
+          state.keys[key] = Date.now();
+          state.hourCount += 1;
+        }
+        if (!result.ok && result.code === 'verify_required') {
+          state.verifyUntil = Date.now() + 6 * 3600_000;
+          stopped = result.message;
+          break;
+        }
+      }
+      if (stopped) break;
+    }
+
+    state.lastRunAt = Date.now();
+    await saveReplyState(state);
+    return {
+      ok: replied.some((x) => x.ok) || (Boolean(scanned.length) && !stopped),
+      scanned,
+      replied,
+      remaining: Math.max(0, config.autoReplyPerHour - state.hourCount),
+      message: stopped || (replied.length ? `回了 ${replied.filter((x) => x.ok).length} 条。` : '这几条作品下没有新评论。'),
+    };
   };
 
   // 复用登录导入的归属检查：窗口必须是本插件启动且会话标记对得上，否则不往它里面发任何操作。
@@ -892,6 +1019,50 @@ export async function apply(ctx: Context) {
   });
 
   ctx.tools.registerTransient({
+    name: 'douyin_reply',
+    danger: 'full',
+    schema: shape({ awemeId: text, text, match: text, index: { type: 'integer', minimum: 0, maximum: 200 } }, ['awemeId', 'text']),
+    description:
+      '回一条作品评论：awemeId 是要回的作品 ID；text 是回复内容（最长 100 字）；用 match 给评论正文片段或作者昵称来定位，或用 index 给评论在列表里的下标（从 0 开始）。' +
+      '只回别人的评论，作者自己的不回；回复前要求设置页打开「允许发表评论」并开着登录窗口。发送后会回读页面确认。',
+    async run(args: any): Promise<any> {
+      if (!config.allowComment) {
+        return {
+          content: { status: 'error', error: { code: 'comment_disabled', message: '「允许发表评论」开关没开，先到设置页打开。' } },
+          receipt: { action: 'douyin_reply', status: 'error', code: 'comment_disabled' },
+        };
+      }
+      const owned = await ensureOwnedWindow();
+      if (!owned.ok) {
+        return {
+          content: { status: 'error', error: { code: 'window_not_owned', message: owned.message } },
+          receipt: { action: 'douyin_reply', status: 'error', code: 'window_not_owned' },
+        };
+      }
+      const result = await replyToWorkComment(config.loginPort, {
+        awemeId: String(args?.awemeId ?? '').trim(),
+        text: String(args?.text ?? '').trim(),
+        match: String(args?.match ?? '').trim() || undefined,
+        index: args?.index === undefined ? undefined : Number(args.index),
+      });
+      if (!result.ok) {
+        return {
+          content: { status: 'error', error: { code: result.code ?? 'reply_failed', message: result.message } },
+          receipt: { action: 'douyin_reply', status: 'error', code: result.code ?? 'reply_failed' },
+        };
+      }
+      // 记一条回复，避免自动回评论时又回一遍同一句。
+      const state = await readReplyState();
+      state.keys[replyKey(String(args?.awemeId ?? ''), '', result.author ?? '', result.content ?? '')] = Date.now();
+      await saveReplyState(state);
+      return {
+        content: { status: 'ok', untrusted: true, message: result.message, target: { author: result.author, content: result.content }, verified: Boolean(result.verified) },
+        receipt: { action: 'douyin_reply', status: 'ok', awemeId: String(args?.awemeId ?? '') },
+      };
+    },
+  });
+
+  ctx.tools.registerTransient({
     name: 'douyin_binge',
     danger: 'safe',
     schema: shape(
@@ -1180,6 +1351,19 @@ ol.steps{margin:0;padding-left:20px;font-size:13px;color:var(--muted);line-heigh
 </section>
 
 <section class="card">
+  <h2>回评论</h2>
+  <p class="note">打开作品页、找新评论、点「回复」再发出去，全程在登录窗口里点，不走接口。只在最近几条作品的一级评论里挑，作者自己的评论不回；受每小时条数限制，撞到短信/滑块验证会停 6 小时。要先把上面「允许发表评论」打开。</p>
+  <div class="grid">
+    <label>每小时最多回几条<input type="number" id="rPerHour" min="1" max="10" value="${cfg.autoReplyPerHour}"></label>
+    <label>检查最近几条作品<input type="number" id="rWorks" min="1" max="5" value="${cfg.autoReplyWorks}"></label>
+  </div>
+  <label style="margin-top:12px">回复模板（每行一条，随机选；可用 {author} 写对方昵称）<textarea id="rTpl" placeholder="谢谢，{author} 说得挺对的">${String(cfg.autoReplyTemplates).replace(/</g, '&lt;')}</textarea></label>
+  <label class="note" style="margin-top:8px;display:block"><input type="checkbox" id="rAuto" ${cfg.autoReplyEnabled ? 'checked' : ''}> 每 30 分钟自动回一轮（关着就只能手动点下面按钮）</label>
+  <div class="row"><button class="primary" type="button" id="saveReply">保存回评论设置</button><button type="button" id="replyNow">立刻回一轮</button></div>
+  <p class="note" id="replyMsg"></p>
+</section>
+
+<section class="card">
   <h2>手动粘贴（备用）</h2>
   <p class="note">不想让插件开窗口时，自己在浏览器登录 douyin.com，F12 控制台输入 <code>document.cookie</code> 复制整段粘进来。${account?.cookie ? '已保存一段，留空表示不改。' : '现在还没有配置。'}<br>Cookie 只存本机 <code>data/account.json</code>，不会写进日志或回执。</p>
   <form id="c">
@@ -1324,12 +1508,15 @@ const msgEl=document.getElementById('loginMsg');
 const say=(t,ok)=>{msgEl.textContent=t;msgEl.style.color=ok?'#1f7a4d':'#9a3030';};
 const setBadge=(on)=>{const b=document.getElementById('badge');if(b){b.textContent=on?'已登录':'未登录';b.style.color=on?'#1f7a4d':'#9a3030';}};
 const callLogin=async(name)=>{say('处理中…',true);try{const r=await fetch('${base}/login/'+name+'?_='+Date.now(),{method:'POST',headers:{'Content-Type':'application/json'},body:'{}',cache:'no-store'});const j=await r.json();say((j.message||(j.ok?'完成。':'失败。'))+(j.count?(' · 读到 '+j.count+' 个 Cookie'):''),j.ok!==false);if(name==='import'&&j.loggedIn)setBadge(true);refreshLogin();return j;}catch(e){say('请求失败：'+(e&&e.message||e),false);}};
+const refreshReply=async()=>{try{const j=await postJson('reply/state',{});const el=document.getElementById('replyMsg');if(!el)return;const parts=[];parts.push('本轮剩余配额 '+(j.remaining??0)+' 条');if(j.lastRunAt)parts.push('上次回评 '+new Date(j.lastRunAt).toLocaleTimeString('zh-CN'));if(j.verifyUntil&&new Date(j.verifyUntil)>new Date())parts.push('验证码冷却到 '+new Date(j.verifyUntil).toLocaleTimeString('zh-CN'));if(j.repliedTotal)parts.push('累计已回 '+j.repliedTotal+' 条');el.textContent=parts.join(' ｜ ');}catch(e){}};
 const refreshLogin=async()=>{try{const j=await stateGet('${base}/login/state?_='+Date.now());const mn={visible:'可见',offscreen:'隐藏',headless:'无界面'};const label=j.open?('已打开（'+((j.mode&&mn[j.mode])||'可用')+'）'):(j.portOpen?'端口在听但连不上，关掉重开一次':'未打开');const br=j.browser?String(j.browser).split(/[\\\\/]/).pop():'没找到浏览器';const ch=j.challenge==='sms'?' ｜ 要短信验证':(j.challenge==='captcha'?' ｜ 挂着滑块/安全验证':'');stateEl.textContent='窗口状态：'+label+' ｜ 端口 '+(j.port||'?')+' ｜ 浏览器 '+br+ch;}catch(e){stateEl.textContent='窗口状态：读取失败，刷新页面重试';}};
 refreshLogin(); setInterval(refreshLogin,5000);
 document.getElementById('open').onclick=()=>callLogin('open');
 document.getElementById('import').onclick=()=>callLogin('import');
 document.getElementById('close').onclick=()=>callLogin('close');
 document.getElementById('saveLocal').onclick=async()=>{try{const j=await postJson('config',{config:{loginPort:Number(document.getElementById('lPort').value),browserPath:document.getElementById('lBrowser').value.trim(),textCardTitle:document.getElementById('cardTitle').value.trim()}});document.getElementById('localMsg').textContent=j.ok?'已保存。端口或浏览器路径改过的话，关掉登录窗口再重开才生效。':'保存失败：'+(j.error||'');refreshLogin();}catch(e){document.getElementById('localMsg').textContent='保存失败：'+(e&&e.message||e);}};
+document.getElementById('saveReply').onclick=async()=>{try{const j=await postJson('config',{config:{autoReplyEnabled:document.getElementById('rAuto').checked,autoReplyTemplates:document.getElementById('rTpl').value,autoReplyPerHour:Number(document.getElementById('rPerHour').value),autoReplyWorks:Number(document.getElementById('rWorks').value)}});document.getElementById('replyMsg').textContent=j.ok?'回评论设置已保存。':'保存失败：'+(j.error||'');refreshReply();}catch(e){document.getElementById('replyMsg').textContent='保存失败：'+(e&&e.message||e);}};
+document.getElementById('replyNow').onclick=async()=>{const el=document.getElementById('replyMsg');el.textContent='正在看最近几条作品的评论…（每条约 10~20 秒）';try{const j=await postJson('reply/run',{});el.textContent=j.ok||j.message?((j.ok?'':'没回：')+(j.message||'')):'没有结果';refreshReply();}catch(e){el.textContent='请求失败：'+(e&&e.message||e);}};
 const postJson=async(path,body)=>{const r=await fetch('${base}/'+path+'?_='+Date.now(),{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body||{}),cache:'no-store'});return r.json();};
 const nowMsg=document.getElementById('nowMsg');
 document.getElementById('nowFeed').onclick=async()=>{nowMsg.textContent='正在刷…';try{const j=await postJson('now/feed');if(!j.ok){nowMsg.textContent='没刷到：'+(j.message||'失败');return;}const it=j.item||{};nowMsg.textContent='刷到：'+(it.desc||'（无文案）')+' ｜ 作者 '+((it.author&&it.author.nickname)||'?')+' ｜ 点赞 '+((it.stats&&it.stats.digg)!=null?it.stats.digg:'?')+(j.opened?' ｜ 已在窗口打开':(j.windowAlive?' ｜ 窗口开着但没跳转':' ｜ 登录窗口没开，只拉了一条数据'));}catch(e){nowMsg.textContent='请求失败：'+(e&&e.message||e);}};
@@ -1346,6 +1533,7 @@ document.getElementById('saveAp').onclick=async()=>{const j=await postJson('conf
 document.getElementById('runAp').onclick=async()=>{const m=document.getElementById('apMsg');m.textContent='正在发布（约 20-60 秒，不要关页面）…';try{const j=await postJson('auto-publish/run');m.textContent=(j.ok?'成功：':'失败：')+(j.message||'')+(j.kind?(' ｜ 类型 '+j.kind):'');refreshAp();}catch(e){m.textContent='请求失败：'+(e&&e.message||e);}};
 const refreshQueue=async()=>{try{const j=await stateGet('${base}/queue?_='+Date.now());const its=(j&&j.items)||[];const pend=its.filter(x=>x.status==='pending');document.getElementById('queueList').textContent=pend.length?('待发布：'+pend.map(x=>new Date(x.at).toLocaleString('zh-CN')+' · '+String(x.desc).slice(0,20)).join(' / ')):'没有待发布的定时任务。';}catch(e){}};
 refreshQueue();
+refreshReply();
 const refreshAuto=async()=>{
   try{
     const j=await stateGet('${base}/auto/state?_='+Date.now());
@@ -1410,6 +1598,10 @@ document.getElementById('i').onsubmit=async e=>{e.preventDefault();const t=e.tar
         loginPort: patch.loginPort === undefined ? current.loginPort : num(patch.loginPort, current.loginPort, 1024, 65535),
         browserPath: patch.browserPath === undefined ? current.browserPath : String(patch.browserPath || '').trim().slice(0, 400),
         textCardTitle: patch.textCardTitle === undefined ? current.textCardTitle : String(patch.textCardTitle || '').trim().slice(0, 60),
+        autoReplyEnabled: patch.autoReplyEnabled === undefined ? current.autoReplyEnabled : bool(patch.autoReplyEnabled, current.autoReplyEnabled),
+        autoReplyTemplates: patch.autoReplyTemplates === undefined ? current.autoReplyTemplates : String(patch.autoReplyTemplates || '').slice(0, 2000),
+        autoReplyPerHour: patch.autoReplyPerHour === undefined ? current.autoReplyPerHour : num(patch.autoReplyPerHour, current.autoReplyPerHour, 1, 10),
+        autoReplyWorks: patch.autoReplyWorks === undefined ? current.autoReplyWorks : num(patch.autoReplyWorks, current.autoReplyWorks, 1, 5),
         autoPublishEnabled: patch.autoPublishEnabled === undefined ? current.autoPublishEnabled : bool(patch.autoPublishEnabled, current.autoPublishEnabled),
         autoPublishMode: (String(patch.autoPublishMode) === 'random' ? 'random' : patch.autoPublishMode === 'fixed' ? 'fixed' : current.autoPublishMode) as Config['autoPublishMode'],
         autoPublishTimes: patch.autoPublishTimes === undefined ? current.autoPublishTimes : String(patch.autoPublishTimes || '').slice(0, 200),
@@ -1680,6 +1872,30 @@ document.getElementById('i').onsubmit=async e=>{e.preventDefault();const t=e.tar
   ctx.web.api(`${base}/queue`, async (_req: any, res: any) => {
     const items = await readQueue();
     sendJson(res, 200, { ok: true, items });
+  });
+
+  ctx.web.api(`${base}/reply/state`, async (_req: any, res: any) => {
+    const state = await readReplyState();
+    const remaining = Math.max(0, config.autoReplyPerHour - (Date.now() - state.hourAt > 3600_000 ? 0 : state.hourCount));
+    sendJson(res, 200, {
+      ok: true,
+      remaining,
+      lastRunAt: state.lastRunAt || 0,
+      verifyUntil: state.verifyUntil || 0,
+      repliedTotal: Object.keys(state.keys).length,
+      enabled: config.autoReplyEnabled,
+      allowComment: config.allowComment,
+      templates: replyTemplates().length,
+    });
+  });
+
+  ctx.web.api(`${base}/reply/run`, async (_req: any, res: any) => {
+    try {
+      const result = await runAutoReply();
+      sendJson(res, 200, result);
+    } catch (error: any) {
+      sendJson(res, 200, { ok: false, message: String(error?.message ?? error).slice(0, 200) });
+    }
   });
 
   ctx.web.api(`${base}/queue/delete`, async (req: any, res: any, context: any) => {
@@ -1997,10 +2213,27 @@ document.getElementById('i').onsubmit=async e=>{e.preventDefault();const t=e.tar
     ctx.logger.warn('抖音自主发布', { ok: Boolean(result.ok), mode: config.autoPublishMode, message: String(result.message ?? '').slice(0, 80) });
   };
 
+  // 自动回评论单独节流：30 分钟一轮，顺便让上一条已经跑完了再开始下一条。
+  let replying = false;
+  const autoReplyTick = async () => {
+    if (replying) return;
+    replying = true;
+    try {
+      const state = await readReplyState();
+      if (Date.now() - state.lastRunAt < 25 * 60000) return;
+      const result = await runAutoReply();
+      if (result?.code === 'reply_disabled' || result?.code === 'no_template' || result?.code === 'comment_disabled') return;
+      ctx.logger.warn('抖音自动回评论', { ok: Boolean(result?.ok), replied: result?.replied?.length ?? 0, message: String(result?.message ?? '').slice(0, 80) });
+    } finally {
+      replying = false;
+    }
+  };
+
   const queueTimer = setInterval(() => {
     drainQueue().catch((error: any) => ctx.logger.warn('抖音队列检查失败', { error: String(error?.message ?? error).slice(0, 120) }));
     autoTick().catch((error: any) => ctx.logger.warn('抖音自动刷检查失败', { error: String(error?.message ?? error).slice(0, 120) }));
     autoPublishTick().catch((error: any) => ctx.logger.warn('抖音自主发布检查失败', { error: String(error?.message ?? error).slice(0, 120) }));
+    autoReplyTick().catch((error: any) => ctx.logger.warn('抖音自动回评论检查失败', { error: String(error?.message ?? error).slice(0, 120) }));
   }, 60000);
   queueTimer.unref?.();
   if (typeof (ctx as any).effect === 'function') {
@@ -2020,5 +2253,5 @@ document.getElementById('i').onsubmit=async e=>{e.preventDefault();const t=e.tar
     cache.clear();
   });
 
-  ctx.logger.info('抖音插件已加载：douyin_status / douyin_feed / douyin_search / douyin_view / douyin_comments / douyin_user / douyin_works / douyin_binge / douyin_interact / douyin_now / douyin_publish');
+  ctx.logger.info('抖音插件已加载：douyin_status / douyin_feed / douyin_search / douyin_view / douyin_comments / douyin_user / douyin_works / douyin_binge / douyin_interact / douyin_now / douyin_publish / douyin_reply');
 }
