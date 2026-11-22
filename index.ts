@@ -5,7 +5,7 @@ import { join } from 'node:path';
 import { createApi, cookieHeader, isLoggedIn, type Account } from './lib/api.ts';
 import { coverUrl, download, pickPlayUrl } from './lib/media.ts';
 import { closeLoginWindow, cdpAlive, loginState, loginToken, openLoginWindow, portOpen as portOpenFn, readCookies, verifySession } from './lib/browser.ts';
-import { publishImages, connectCdp } from './lib/creator.ts';
+import { publishImages, publishVideo, listMyWorks, pageChallenge, connectCdp } from './lib/creator.ts';
 import { comfyGenerate } from './lib/comfy.ts';
 import { renderTextCard } from './lib/textcard.ts';
 import { swipeRecommend } from './lib/swipe.ts';
@@ -249,6 +249,8 @@ export async function apply(ctx: Context) {
     id: string;
     desc: string;
     images: string[];
+    /** 短视频：与 images 互斥，有视频就按视频发。 */
+    video?: string;
     at: number;
     createdAt: number;
     status: 'pending' | 'done' | 'failed';
@@ -272,13 +274,21 @@ export async function apply(ctx: Context) {
     return { ok: false, message: `该窗口无法确认属于当前实例（${check.reason ?? '会话标记对不上'}）。请先点「关闭登录窗口」，再重新打开专用窗口。` };
   };
 
-  const runPublish = async (input: { desc: string; images?: string[]; comfyPrompt?: string }) => {
+  const runPublish = async (input: { desc: string; images?: string[]; comfyPrompt?: string; video?: string }) => {
     if (!config.publishEnabled) {
       return { ok: false as const, code: 'publish_disabled', message: '发布开关没开。先在设置页勾上「允许发布」。' };
     }
     const owned = await ensureOwnedWindow();
     if (!owned.ok) {
       return { ok: false as const, code: 'window_not_owned', message: owned.message };
+    }
+    // 短视频优先：给了视频就不再走图文。
+    const video = String(input.video ?? '').trim();
+    if (video) {
+      const result = await publishVideo(config.loginPort, { video, desc: input.desc });
+      return result.ok
+        ? { ok: true as const, kind: 'video' as const, message: result.message }
+        : { ok: false as const, code: result.code ?? 'video_failed', message: result.message };
     }
     let images = Array.isArray(input.images) ? input.images.slice(0, 9) : [];
     if (!images.length && input.comfyPrompt) {
@@ -293,7 +303,7 @@ export async function apply(ctx: Context) {
       images = (gen.paths ?? []).slice(0, 9);
     }
     if (!images.length) {
-      return { ok: false as const, code: 'no_image', message: '没有图片。给本地路径，或者用 ComfyUI 提示词生成。' };
+      return { ok: false as const, code: 'no_image', message: '没有图片。给本地路径、用 ComfyUI 提示词生成，或者给一个视频路径。' };
     }
     return publishImages(config.loginPort, { images, desc: input.desc });
   };
@@ -318,11 +328,13 @@ export async function apply(ctx: Context) {
       return;
     }
     for (const item of due) {
-      const result = await publishImages(config.loginPort, { images: item.images, desc: item.desc });
+      const result = item.video
+        ? await publishVideo(config.loginPort, { video: item.video, desc: item.desc })
+        : await publishImages(config.loginPort, { images: item.images, desc: item.desc });
       item.status = result.ok ? 'done' : 'failed';
       item.message = result.message;
       await saveQueue(items);
-      ctx.logger.warn('抖音定时发布', { id: item.id, ok: result.ok, message: String(result.message).slice(0, 80) });
+      ctx.logger.warn('抖音定时发布', { id: item.id, kind: item.video ? 'video' : 'image', ok: result.ok, message: String(result.message).slice(0, 80) });
     }
   };
 
@@ -845,6 +857,41 @@ export async function apply(ctx: Context) {
   });
 
   ctx.tools.registerTransient({
+    name: 'douyin_works',
+    danger: 'safe',
+    schema: shape({ count }, []),
+    description:
+      '列出当前登录账号自己的作品（在登录窗口打开「我的」页作品网格读取，只读不点任何按钮）：返回作品 ID、类型（视频/图文）和标题。' +
+      '用于发布后核对作品是否真的在号上，或挑一条旧作品再去读评论。要求登录窗口开着且已登录。',
+    async run(args: any): Promise<any> {
+      const owned = await ensureOwnedWindow();
+      if (!owned.ok) {
+        return {
+          content: { status: 'error', error: { code: 'window_not_owned', message: owned.message } },
+          receipt: { action: 'douyin_works', status: 'error', code: 'window_not_owned' },
+        };
+      }
+      const list = await listMyWorks(config.loginPort, num(args?.count, 20, 1, 50));
+      if (!list.ok) {
+        return {
+          content: { status: 'error', error: { code: 'works_failed', message: list.message ?? '读作品失败。' } },
+          receipt: { action: 'douyin_works', status: 'error', code: 'works_failed' },
+        };
+      }
+      const items = (list.items ?? []).map((x) => ({
+        awemeId: x.id,
+        kind: x.kind === 'note' ? '图文' : '视频',
+        title: x.title,
+        url: `https://www.douyin.com/${x.kind === 'note' ? 'note' : 'video'}/${x.id}`,
+      }));
+      return {
+        content: { status: 'ok', count: items.length, items },
+        receipt: { action: 'douyin_works', status: 'ok', count: items.length },
+      };
+    },
+  });
+
+  ctx.tools.registerTransient({
     name: 'douyin_binge',
     danger: 'safe',
     schema: shape(
@@ -982,13 +1029,15 @@ export async function apply(ctx: Context) {
       {
         desc: { type: 'string', minLength: 1 },
         images: { type: 'array', items: { type: 'string' } },
+        video: text,
         comfyPrompt: text,
         at: text,
       },
       ['desc'],
     ),
     description:
-      '往抖音发一条图文：desc 是作品描述；images 给本地图片绝对路径（最多 9 张）；没图片但给了 comfyPrompt 就用 ComfyUI 生成；' +
+      '往抖音发一条作品：desc 是作品描述；images 给本地图片绝对路径（最多 9 张）发图文；video 给一个本地视频文件路径发短视频（与 images 互斥，有视频就按视频发，先等转码出可播放预览才点发布）；' +
+      '既没有图片也没视频但给了 comfyPrompt 就用 ComfyUI 生成图。' +
       'at 按本机时区写「YYYY-MM-DD HH:mm」即定时发布，留空立即发。发布是对外可见的真实操作，要求设置页打开发布开关、登录窗口开着。' +
       '发布成功不等于有人看到或审核通过。',
     async run(args: any, session: any): Promise<any> {
@@ -1000,6 +1049,7 @@ export async function apply(ctx: Context) {
         };
       }
       const images: string[] = Array.isArray(args?.images) ? args.images.map((x: any) => String(x).trim()).filter(Boolean) : [];
+      const video = String(args?.video ?? '').trim();
       const comfyPrompt = String(args?.comfyPrompt ?? '').trim();
       const at = String(args?.at ?? '').trim();
       if (at) {
@@ -1011,14 +1061,14 @@ export async function apply(ctx: Context) {
           };
         }
         const items = await readQueue();
-        items.push({ id: `p${Date.now()}`, desc, images, at: ts, createdAt: Date.now(), status: 'pending' });
+        items.push({ id: `p${Date.now()}`, desc, images, video: video || undefined, at: ts, createdAt: Date.now(), status: 'pending' });
         await saveQueue(items);
         return {
-          content: { status: 'ok', scheduled: true, at: new Date(ts).toISOString(), desc },
+          content: { status: 'ok', scheduled: true, at: new Date(ts).toISOString(), desc, kind: video ? 'video' : 'image' },
           receipt: { action: 'douyin_publish', status: 'scheduled', at: ts },
         };
       }
-      const result = await runPublish({ desc, images, comfyPrompt });
+      const result = await runPublish({ desc, images, comfyPrompt, video });
       if (!result.ok) {
         return {
           content: { status: 'error', error: { code: (result as any).code ?? 'publish_failed', message: result.message } },
@@ -1078,10 +1128,13 @@ h1{font-size:27px;letter-spacing:-.5px;margin:0 0 4px;font-weight:650}
 p.sub{margin:0;color:var(--muted);font-size:13px}
 section.card{background:var(--paper);border:1px solid var(--line);border-radius:14px;padding:20px 22px;margin:18px 0}
 h2{font-size:16px;margin:0 0 12px}
-label{display:grid;gap:6px;font-size:13px;color:var(--muted)}
-input,textarea,select{font:inherit;padding:9px 12px;border:1px solid var(--line);border-radius:7px;background:var(--paper);color:var(--ink);width:100%}
-textarea{min-height:96px;resize:vertical;font-family:ui-monospace,Consolas,monospace;font-size:12px}
-.grid{display:grid;grid-template-columns:1fr 1fr;gap:14px 18px}
+label{display:grid;gap:6px;font-size:13px;color:var(--muted);min-width:0}
+input,textarea,select{font:inherit;padding:9px 12px;border:1px solid var(--line);border-radius:7px;background:var(--paper);color:var(--ink);width:100%;height:40px;min-width:0;box-sizing:border-box;line-height:1.5;vertical-align:middle}
+textarea{min-height:96px;height:auto;resize:vertical;font-family:ui-monospace,Consolas,monospace;font-size:12px}
+input[type=checkbox],input[type=radio]{width:auto;height:auto}
+select{cursor:pointer}
+input[type=number]{font-variant-numeric:tabular-nums}
+.grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:14px 18px;align-items:start}
 .wide{grid-column:1/-1}
 .row{display:flex;gap:10px;align-items:center;margin-top:18px;flex-wrap:wrap}
 button{font:inherit;padding:9px 14px;border:1px solid var(--line);border-radius:7px;background:var(--paper);color:var(--ink);cursor:pointer}
@@ -1146,6 +1199,7 @@ ol.steps{margin:0;padding-left:20px;font-size:13px;color:var(--muted);line-heigh
   <div id="postBox" style="display:none;margin-top:16px">
     <label>作品描述（必填）<textarea id="pDesc" placeholder="写点什么，最多 1000 字"></textarea></label>
     <label style="margin-top:12px">图片本地路径（每行一个，最多 9 张；留空则用 ComfyUI 生成）<textarea id="pImgs" placeholder="每行一个绝对路径，例如 C:\\Users\\你的用户名\\Pictures\\1.png"></textarea></label>
+    <label style="margin-top:12px">视频本地路径（填了就走短视频：与图片互斥，会等转码出可播放预览才点发布）<input id="pVideo" placeholder="例如 C:\\Users\\你的用户名\\Videos\\clip.mp4"></label>
     <label style="margin-top:12px">ComfyUI 提示词（要生图时填）<input id="pPrompt" placeholder="例如：赛博朋克夜市，霓虹灯，竖构图"></label>
     <label style="margin-top:12px">发布时机（留空=现在；或写 YYYY-MM-DD HH:mm，按本机时区）<input id="pAt" placeholder="留空立即发布"></label>
     <div class="row"><button class="primary" type="button" id="pSend">发布到抖音</button><span class="note" id="pubHint">发布是对外可见的真实操作</span></div>
@@ -1270,7 +1324,7 @@ const msgEl=document.getElementById('loginMsg');
 const say=(t,ok)=>{msgEl.textContent=t;msgEl.style.color=ok?'#1f7a4d':'#9a3030';};
 const setBadge=(on)=>{const b=document.getElementById('badge');if(b){b.textContent=on?'已登录':'未登录';b.style.color=on?'#1f7a4d':'#9a3030';}};
 const callLogin=async(name)=>{say('处理中…',true);try{const r=await fetch('${base}/login/'+name+'?_='+Date.now(),{method:'POST',headers:{'Content-Type':'application/json'},body:'{}',cache:'no-store'});const j=await r.json();say((j.message||(j.ok?'完成。':'失败。'))+(j.count?(' · 读到 '+j.count+' 个 Cookie'):''),j.ok!==false);if(name==='import'&&j.loggedIn)setBadge(true);refreshLogin();return j;}catch(e){say('请求失败：'+(e&&e.message||e),false);}};
-const refreshLogin=async()=>{try{const j=await stateGet('${base}/login/state?_='+Date.now());const mn={visible:'可见',offscreen:'隐藏',headless:'无界面'};const label=j.open?('已打开（'+((j.mode&&mn[j.mode])||'可用')+'）'):(j.portOpen?'端口在听但连不上，关掉重开一次':'未打开');const br=j.browser?String(j.browser).split(/[\\\\/]/).pop():'没找到浏览器';stateEl.textContent='窗口状态：'+label+' ｜ 端口 '+(j.port||'?')+' ｜ 浏览器 '+br;}catch(e){stateEl.textContent='窗口状态：读取失败，刷新页面重试';}};
+const refreshLogin=async()=>{try{const j=await stateGet('${base}/login/state?_='+Date.now());const mn={visible:'可见',offscreen:'隐藏',headless:'无界面'};const label=j.open?('已打开（'+((j.mode&&mn[j.mode])||'可用')+'）'):(j.portOpen?'端口在听但连不上，关掉重开一次':'未打开');const br=j.browser?String(j.browser).split(/[\\\\/]/).pop():'没找到浏览器';const ch=j.challenge==='sms'?' ｜ 要短信验证':(j.challenge==='captcha'?' ｜ 挂着滑块/安全验证':'');stateEl.textContent='窗口状态：'+label+' ｜ 端口 '+(j.port||'?')+' ｜ 浏览器 '+br+ch;}catch(e){stateEl.textContent='窗口状态：读取失败，刷新页面重试';}};
 refreshLogin(); setInterval(refreshLogin,5000);
 document.getElementById('open').onclick=()=>callLogin('open');
 document.getElementById('import').onclick=()=>callLogin('import');
@@ -1281,7 +1335,7 @@ const nowMsg=document.getElementById('nowMsg');
 document.getElementById('nowFeed').onclick=async()=>{nowMsg.textContent='正在刷…';try{const j=await postJson('now/feed');if(!j.ok){nowMsg.textContent='没刷到：'+(j.message||'失败');return;}const it=j.item||{};nowMsg.textContent='刷到：'+(it.desc||'（无文案）')+' ｜ 作者 '+((it.author&&it.author.nickname)||'?')+' ｜ 点赞 '+((it.stats&&it.stats.digg)!=null?it.stats.digg:'?')+(j.opened?' ｜ 已在窗口打开':(j.windowAlive?' ｜ 窗口开着但没跳转':' ｜ 登录窗口没开，只拉了一条数据'));}catch(e){nowMsg.textContent='请求失败：'+(e&&e.message||e);}};
 document.getElementById('nowPost').onclick=()=>{const box=document.getElementById('postBox');box.style.display=box.style.display==='none'?'block':'none';};
 document.getElementById('openCreator').onclick=async()=>{const j=await postJson('creator/open');nowMsg.textContent=j.message||'';};
-document.getElementById('pSend').onclick=async()=>{const hint=document.getElementById('pubHint');const desc=document.getElementById('pDesc').value.trim();const imgs=document.getElementById('pImgs').value.split(String.fromCharCode(10)).map(s=>s.trim()).filter(Boolean);const comfyPrompt=document.getElementById('pPrompt').value.trim();const at=document.getElementById('pAt').value.trim();if(!desc){hint.textContent='先写作品描述';return;}hint.textContent='处理中…发布会在登录窗口里操作，约 20 秒';try{const j=await postJson('publish',{desc,images:imgs,comfyPrompt,at});hint.textContent=(j.ok?'成功：':'失败：')+(j.message||'');refreshQueue();}catch(e){hint.textContent='请求失败：'+(e&&e.message||e);}};
+document.getElementById('pSend').onclick=async()=>{const hint=document.getElementById('pubHint');const desc=document.getElementById('pDesc').value.trim();const imgs=document.getElementById('pImgs').value.split(String.fromCharCode(10)).map(s=>s.trim()).filter(Boolean);const video=document.getElementById('pVideo').value.trim();const comfyPrompt=document.getElementById('pPrompt').value.trim();const at=document.getElementById('pAt').value.trim();if(!desc){hint.textContent='先写作品描述';return;}hint.textContent='处理中…'+(video?'短视频要等转码，可能几分钟':'发布会在登录窗口里操作，约 20 秒');try{const j=await postJson('publish',{desc,images:imgs,video,comfyPrompt,at});hint.textContent=(j.ok?'成功：':'失败：')+(j.message||'');refreshQueue();}catch(e){hint.textContent='请求失败：'+(e&&e.message||e);}};
 document.getElementById('savePub').onclick=async()=>{const j=await postJson('config',{config:{publishEnabled:document.getElementById('pub').checked,comfyServer:document.getElementById('comfy').value.trim(),comfyWorkflow:document.getElementById('wf').value.trim()}});document.getElementById('pubMsg').textContent=j.ok?'已保存。':'保存失败：'+(j.error||'');refreshAp();};
 const apMode=document.getElementById('apMode');
 const syncApMode=()=>{const fixed=apMode.value==='fixed';document.getElementById('apFixed').style.display=fixed?'block':'none';document.getElementById('apRandom').style.display=fixed?'none':'block';};
@@ -1378,6 +1432,8 @@ document.getElementById('i').onsubmit=async e=>{e.preventDefault();const t=e.tar
     // 唯一判据：CDP 能不能握手。PID、端口在听都会骗人，握手成功才算真的能用。
     const cdp = await cdpAlive(config.loginPort);
     const listening = cdp ? true : await portOpenFn(config.loginPort);
+    // 页面上挂着验证码时提前告诉用户，省得发布/读作品时才撞墙。
+    const challenge = cdp ? await pageChallenge(config.loginPort) : '';
     sendJson(res, 200, {
       ok: true,
       open: cdp,
@@ -1385,6 +1441,7 @@ document.getElementById('i').onsubmit=async e=>{e.preventDefault();const t=e.tar
       pid: state.pid,
       port: config.loginPort,
       browser: state.browser,
+      challenge,
       mode: state.mode,
       profile: state.profile,
     });
@@ -1510,6 +1567,7 @@ document.getElementById('i').onsubmit=async e=>{e.preventDefault();const t=e.tar
         ? body.images.map((x: any) => String(x).trim()).filter(Boolean)
         : String(body?.images ?? '').split('\n').map((s) => s.trim()).filter(Boolean);
       const comfyPrompt = String(body?.comfyPrompt ?? '').trim();
+      const video = String(body?.video ?? '').trim();
       const at = String(body?.at ?? '').trim();
       if (at) {
         const ts = Date.parse(at.replace(/-/g, '/'));
@@ -1521,17 +1579,17 @@ document.getElementById('i').onsubmit=async e=>{e.preventDefault();const t=e.tar
           sendJson(res, 200, { ok: false, message: '定时时间要比现在至少晚 1 分钟。' });
           return;
         }
-        if (!images.length && !comfyPrompt) {
-          sendJson(res, 200, { ok: false, message: '定时发布得先备好图片（本地路径或 ComfyUI 提示词）。' });
+        if (!images.length && !comfyPrompt && !video) {
+          sendJson(res, 200, { ok: false, message: '定时发布得先备好内容：图片路径、ComfyUI 提示词，或者一个视频路径。' });
           return;
         }
         const items = await readQueue();
-        items.push({ id: `p${Date.now()}`, desc, images, at: ts, createdAt: Date.now(), status: 'pending' });
+        items.push({ id: `p${Date.now()}`, desc, images, video: video || undefined, at: ts, createdAt: Date.now(), status: 'pending' });
         await saveQueue(items);
-        sendJson(res, 200, { ok: true, scheduled: true, at: ts, message: `已排进队列，${new Date(ts).toLocaleString('zh-CN')} 发布。` });
+        sendJson(res, 200, { ok: true, scheduled: true, at: ts, kind: video ? 'video' : 'image', message: `已排进队列，${new Date(ts).toLocaleString('zh-CN')} 发布。` });
         return;
       }
-      const result = await runPublish({ desc, images, comfyPrompt });
+      const result = await runPublish({ desc, images, comfyPrompt, video });
       sendJson(res, 200, result);
     } catch (error: any) {
       sendJson(res, 200, { ok: false, message: String(error?.message ?? error).slice(0, 200) });
@@ -1962,5 +2020,5 @@ document.getElementById('i').onsubmit=async e=>{e.preventDefault();const t=e.tar
     cache.clear();
   });
 
-  ctx.logger.info('抖音插件已加载：douyin_status / douyin_feed / douyin_search / douyin_view / douyin_comments / douyin_user / douyin_binge / douyin_interact / douyin_now / douyin_publish');
+  ctx.logger.info('抖音插件已加载：douyin_status / douyin_feed / douyin_search / douyin_view / douyin_comments / douyin_user / douyin_works / douyin_binge / douyin_interact / douyin_now / douyin_publish');
 }
