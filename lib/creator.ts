@@ -23,52 +23,71 @@ export async function connectCdp(port: number, timeoutMs = 8000): Promise<Cdp | 
   } catch {
     return null;
   }
-  const page = targets.find((t) => t?.type === 'page' && t?.webSocketDebuggerUrl);
-  if (!page) return null;
-  const ws = new WebSocket(page.webSocketDebuggerUrl);
-  let seq = 0;
-  const pending = new Map<number, (v: any) => void>();
-  const opened = await new Promise<boolean>((resolve) => {
-    const timer = setTimeout(() => resolve(false), timeoutMs);
-    timer.unref?.();
-    ws.addEventListener('open', () => {
-      clearTimeout(timer);
-      resolve(true);
+  const pages = targets.filter((t) => t?.type === 'page' && t?.webSocketDebuggerUrl);
+  if (!pages.length) return null;
+
+  const attach = async (page: any, waitMs: number): Promise<{ cdp: any; ws: WebSocket } | null> => {
+    const ws = new WebSocket(page.webSocketDebuggerUrl);
+    let seq = 0;
+    const pending = new Map<number, (v: any) => void>();
+    const opened = await new Promise<boolean>((resolve) => {
+      const timer = setTimeout(() => resolve(false), waitMs);
+      timer.unref?.();
+      ws.addEventListener('open', () => {
+        clearTimeout(timer);
+        resolve(true);
+      });
+      ws.addEventListener('error', () => {
+        clearTimeout(timer);
+        resolve(false);
+      });
     });
-    ws.addEventListener('error', () => {
-      clearTimeout(timer);
-      resolve(false);
-    });
-  });
-  if (!opened) {
-    try {
-      ws.close();
-    } catch {}
-    return null;
-  }
-  ws.addEventListener('message', (event) => {
-    let message: any;
-    try {
-      message = JSON.parse(String(event.data));
-    } catch {
-      return;
+    if (!opened) {
+      try {
+        ws.close();
+      } catch {}
+      return null;
     }
-    if (message.id && pending.has(message.id)) {
-      pending.get(message.id)!(message);
-      pending.delete(message.id);
-    }
-  });
-  const send = (method: string, params: Record<string, unknown> = {}) =>
-    new Promise<any>((resolve) => {
-      const id = ++seq;
-      pending.set(id, resolve);
-      ws.send(JSON.stringify({ id, method, params }));
+    ws.addEventListener('message', (event) => {
+      let message: any;
+      try {
+        message = JSON.parse(String(event.data));
+      } catch {
+        return;
+      }
+      if (message.id && pending.has(message.id)) {
+        pending.get(message.id)!(message);
+        pending.delete(message.id);
+      }
     });
-  const evaluate = async (expression: string) => {
-    const res = await send('Runtime.evaluate', { expression, returnByValue: true, awaitPromise: true });
-    return res?.result?.result?.value;
+    const send = (method: string, params: Record<string, unknown> = {}) =>
+      new Promise<any>((resolve) => {
+        const id = ++seq;
+        pending.set(id, resolve);
+        ws.send(JSON.stringify({ id, method, params }));
+      });
+    const evaluate = async (expression: string) => {
+      const res = await send('Runtime.evaluate', { expression, returnByValue: true, awaitPromise: true });
+      return res?.result?.result?.value;
+    };
+    return { cdp: { send, evaluate, close: () => ws.close() }, ws };
   };
-  return { send, evaluate, close: () => ws.close() };
+
+  // 同一个网址可能挂着多个标签页（插件重复打开会留下一个隐藏的副本）。
+  // 隐藏标签页收不到 Input.dispatchMouseEvent，点了等于没点，所以优先选可见的那个。
+  let fallback: any = null;
+  for (const page of pages) {
+    const hit = await attach(page, Math.min(timeoutMs, 4000));
+    if (!hit) continue;
+    const vis = await hit.cdp.evaluate('document.visibilityState').catch(() => null);
+    if (vis === 'visible') return hit.cdp;
+    if (!fallback) fallback = hit.cdp;
+    else hit.cdp.close();
+  }
+  if (!fallback) return null;
+  // 都不可见（窗口最小化等）：把第一个标签页拉到前台，后续点击才有落点。
+  await fallback.send('Page.bringToFront', {});
+  return fallback;
 }
 
 export async function creatorPage(port: number): Promise<{ ok: boolean; href?: string; loggedIn?: boolean; message?: string }> {
