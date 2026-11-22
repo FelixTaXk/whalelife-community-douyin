@@ -1537,7 +1537,7 @@ ol.steps{margin:0;padding-left:20px;font-size:13px;color:var(--muted);line-heigh
     <label>每轮作品数（1-10）<input type="number" id="autoCount" min="1" max="10" value="${cfg.autoFeedCount}"></label>
   </div>
   <div class="check"><input type="checkbox" id="autoOpen" ${cfg.autoFeedOpenWindow ? 'checked' : ''}><label for="autoOpen" style="display:block">在登录窗口里依次打开（每条停 4 秒）</label></div>
-  <div class="check"><input type="checkbox" id="autoScroll" ${cfg.autoFeedScroll ? 'checked' : ''}><label for="autoScroll" style="display:block">连续滑（像真人一条条往下切，滚不动时补方向键）</label></div>
+  <div class="check"><input type="checkbox" id="autoScroll" ${cfg.autoFeedScroll ? 'checked' : ''}><label for="autoScroll" style="display:block">连续切（点播放器的「下一条」逐条换，失效视频自动跳过）</label></div>
   <div class="check"><input type="checkbox" id="autoLike" ${cfg.autoInteractEnabled ? 'checked' : ''}><label for="autoLike" style="display:block">刷到合适的自动点赞 + 收藏（只点赞收藏，永不评论）</label></div>
   <label style="margin-top:12px">人设关键词（必填，命中就赞；插件只读这里的词，不读宿主人格配置）<textarea id="autoPersona" rows="3" placeholder="按你自己的人设挑词，逗号或换行分隔，例如：水彩,拍照,胶片,手账">${String(cfg.autoInteractPersona).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')}</textarea></label>
   <p class="note" id="personaLine"></p>
@@ -1686,7 +1686,7 @@ const refreshAuto=async()=>{
     const j=await stateGet('${base}/auto/state?_='+Date.now());
     const rounds=(j.rounds||[]);
     const last=rounds[0];
-    document.getElementById('autoLog').textContent=j.enabled?('自动刷已开：每 '+j.minutes+' 分钟刷 '+j.count+' 条'+(j.scroll?'（窗口内连续滑）':'（逐条打开）')+(j.nextAt?'，下次 '+(new Date(j.nextAt)).toLocaleString('zh-CN'):'')+(last?('；上一轮 '+((last.items&&last.items.length)||0)+' 条'+(last.interacted?('，赞藏 '+last.interacted.filter(x=>x.ok&&x.action==='like').length+' 次'):'')):'')):'自动刷未开启。';
+    document.getElementById('autoLog').textContent=j.enabled?('自动刷已开：每 '+j.minutes+' 分钟刷 '+j.count+' 条'+(j.scroll?'（窗口内逐条切）':'（逐条打开）')+(j.nextAt?'，下次 '+(new Date(j.nextAt)).toLocaleString('zh-CN'):'')+(last?('；上一轮 '+((last.items&&last.items.length)||0)+' 条'+(last.interacted?('，赞藏 '+last.interacted.filter(x=>x.ok&&x.action==='like').length+' 次'):'')):'')):'自动刷未开启。';
     const pl=document.getElementById('personaLine');
     if(pl){pl.textContent=j.interact?(((j.personaWords||[]).length)?('人设关键词 '+(j.personaWords||[]).length+' 个：'+(j.personaWords||[]).join('、')):'人设关键词还没填，填了才会开始点赞'):'自动赞藏未开启。';}
   }catch(e){}
@@ -2190,14 +2190,26 @@ document.getElementById('i').onsubmit=async e=>{e.preventDefault();const t=e.tar
         } else {
           const cdp = await connectCdp(config.loginPort);
           if (cdp) {
+            let skipped = 0;
             try {
               for (const item of list) {
                 await cdp.send('Page.navigate', { url: item.url });
+                await new Promise((r) => setTimeout(r, 3200));
+                // 停在这句上说明作品已删除/私密，别算成打开了一条，也别在这里干等。
+                const dead = await cdp.evaluate(`(() => {
+                  const t = String(document.body ? document.body.innerText : '');
+                  return /你要观看的视频不存在|视频不存在|页面不见啦/.test(t);
+                })()`);
+                if (dead) {
+                  skipped += 1;
+                  continue;
+                }
                 opened += 1;
-                await new Promise((r) => setTimeout(r, 4000));
+                await new Promise((r) => setTimeout(r, 800));
               }
             } catch {}
             cdp.close();
+            if (skipped) note = `跳过 ${skipped} 条失效视频`;
           }
         }
       }
