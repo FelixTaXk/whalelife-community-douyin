@@ -36,6 +36,8 @@ type Config = {
   autoFeedScroll: boolean;
   autoInteractEnabled: boolean;
   autoInteractPersona: string;
+  // 生成关键词时备用的人格设定；读不到宿主当前人格时用它。
+  autoInteractPersonaDesc: string;
   autoInteractWhitelist: string;
   autoInteractMinShare: number;
   autoInteractMaxPerRound: number;
@@ -82,6 +84,7 @@ const DEFAULTS: Config = {
   autoFeedScroll: true,
   autoInteractEnabled: false,
   autoInteractPersona: '',
+  autoInteractPersonaDesc: '',
   autoInteractWhitelist: '',
   autoInteractMinShare: 5000,
   autoInteractMaxPerRound: 1,
@@ -223,6 +226,7 @@ export async function apply(ctx: Context) {
       autoFeedScroll: bool(stored.autoFeedScroll, DEFAULTS.autoFeedScroll),
       autoInteractEnabled: bool(stored.autoInteractEnabled, DEFAULTS.autoInteractEnabled),
       autoInteractPersona: String(stored.autoInteractPersona ?? DEFAULTS.autoInteractPersona).slice(0, 2000),
+      autoInteractPersonaDesc: String(stored.autoInteractPersonaDesc ?? DEFAULTS.autoInteractPersonaDesc).slice(0, 2000),
       autoInteractWhitelist: String(stored.autoInteractWhitelist ?? DEFAULTS.autoInteractWhitelist).slice(0, 2000),
       autoInteractMinShare: num(stored.autoInteractMinShare, DEFAULTS.autoInteractMinShare, 0, 1000000),
       autoInteractMaxPerRound: num(stored.autoInteractMaxPerRound, DEFAULTS.autoInteractMaxPerRound, 1, 3),
@@ -1539,7 +1543,12 @@ ol.steps{margin:0;padding-left:20px;font-size:13px;color:var(--muted);line-heigh
   <div class="check"><input type="checkbox" id="autoOpen" ${cfg.autoFeedOpenWindow ? 'checked' : ''}><label for="autoOpen" style="display:block">在登录窗口里依次打开（每条停 4 秒）</label></div>
   <div class="check"><input type="checkbox" id="autoScroll" ${cfg.autoFeedScroll ? 'checked' : ''}><label for="autoScroll" style="display:block">连续切（点播放器的「下一条」逐条换，失效视频自动跳过）</label></div>
   <div class="check"><input type="checkbox" id="autoLike" ${cfg.autoInteractEnabled ? 'checked' : ''}><label for="autoLike" style="display:block">刷到合适的自动点赞 + 收藏（只点赞收藏，永不评论）</label></div>
-  <label style="margin-top:12px">人设关键词（必填，命中就赞；插件只读这里的词，不读宿主人格配置）<textarea id="autoPersona" rows="3" placeholder="按你自己的人设挑词，逗号或换行分隔，例如：水彩,拍照,胶片,手账">${String(cfg.autoInteractPersona).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')}</textarea></label>
+  <label style="margin-top:12px">人设关键词（必填，命中就赞；也可以点下面的按钮按人格设定生成）<textarea id="autoPersona" rows="3" placeholder="按你自己的人设挑词，逗号或换行分隔，例如：水彩,拍照,胶片,手账">${String(cfg.autoInteractPersona).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')}</textarea></label>
+  <div class="row" style="margin-top:8px;align-items:center">
+    <button type="button" id="genPersona">✨ 一键生成关键词</button>
+    <span class="note" id="genPersonaMsg" style="margin:0">优先读宿主当前人格，读不到再用下面的「人格设定」</span>
+  </div>
+  <label style="margin-top:8px">人格设定（备用，可留空；生成时读不到宿主人格就用这段）<textarea id="autoPersonaDesc" rows="3" placeholder="例如：我是爱逛展、拍照、做手账的人，喜欢胶片质感和城市漫步">${String(cfg.autoInteractPersonaDesc).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')}</textarea></label>
   <p class="note" id="personaLine"></p>
   <label style="margin-top:12px">白名单类型（命中且分享数过门槛才赞）<textarea id="autoWhite" rows="3" placeholder="AI,游戏,数码">${String(cfg.autoInteractWhitelist).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')}</textarea></label>
   <div class="grid">
@@ -1692,7 +1701,8 @@ const refreshAuto=async()=>{
   }catch(e){}
 };
 refreshAuto();
-document.getElementById('saveAuto').onclick=async()=>{const j=await postJson('config',{config:{autoFeedEnabled:document.getElementById('autoOn').checked,autoFeedMinutes:Number(document.getElementById('autoMin').value),autoFeedCount:Number(document.getElementById('autoCount').value),autoFeedOpenWindow:document.getElementById('autoOpen').checked,autoFeedScroll:document.getElementById('autoScroll').checked,windowMode:document.getElementById('winMode').value,autoInteractEnabled:document.getElementById('autoLike').checked,autoInteractPersona:document.getElementById('autoPersona').value,autoInteractWhitelist:document.getElementById('autoWhite').value,autoInteractMinShare:Number(document.getElementById('autoShare').value),autoInteractMaxPerRound:Number(document.getElementById('autoMax').value)}});document.getElementById('autoMsg').textContent=j.ok?'已保存（窗口模式改完要关掉窗口再重开才生效）。':'保存失败：'+(j.error||'');refreshAuto();};
+document.getElementById('saveAuto').onclick=async()=>{const j=await postJson('config',{config:{autoFeedEnabled:document.getElementById('autoOn').checked,autoFeedMinutes:Number(document.getElementById('autoMin').value),autoFeedCount:Number(document.getElementById('autoCount').value),autoFeedOpenWindow:document.getElementById('autoOpen').checked,autoFeedScroll:document.getElementById('autoScroll').checked,windowMode:document.getElementById('winMode').value,autoInteractEnabled:document.getElementById('autoLike').checked,autoInteractPersona:document.getElementById('autoPersona').value,autoInteractPersonaDesc:document.getElementById('autoPersonaDesc').value,autoInteractWhitelist:document.getElementById('autoWhite').value,autoInteractMinShare:Number(document.getElementById('autoShare').value),autoInteractMaxPerRound:Number(document.getElementById('autoMax').value)}});document.getElementById('autoMsg').textContent=j.ok?'已保存（窗口模式改完要关掉窗口再重开才生效）。':'保存失败：'+(j.error||'');refreshAuto();};
+document.getElementById('genPersona').onclick=async()=>{const b=document.getElementById('genPersona');const m=document.getElementById('genPersonaMsg');const ta=document.getElementById('autoPersona');const d=document.getElementById('autoPersonaDesc');const old=b.textContent;b.disabled=true;b.textContent='正在生成…';m.textContent='正在按人格提炼关键词，最多等 60 秒…';try{const j=await postJson('persona/gen',{desc:d.value});if(j.ok&&(j.keywords||[]).length){ta.value=j.keywords.join('，');const sv=await postJson('config',{config:{autoInteractPersona:ta.value,autoInteractPersonaDesc:d.value}});m.textContent='已生成并保存 '+(j.source==='host'?'（来自宿主当前人格）':'（来自人格设定）')+'：'+j.keywords.join('、')+(sv.ok?'':'；但保存失败：'+(sv.error||''));refreshAuto();}else{m.textContent='没生成出来：'+(j.error||'模型没给可用关键词')+'。可以填一段「人格设定」再试。';}}catch(e){m.textContent='请求失败：'+(e&&e.message||e);}finally{b.disabled=false;b.textContent=old;}};
 document.getElementById('runAuto').onclick=async()=>{const m=document.getElementById('autoMsg');m.textContent='正在跑一轮…';try{const j=await postJson('auto/run');if(j.ok){const its=(j.round&&j.round.items)||[];m.textContent='刷了 '+its.length+' 条：'+its.map(x=>String(x.desc).slice(0,12)).join(' / ');}else{m.textContent='失败：'+(j.message||'未知');}refreshAuto();}catch(e){m.textContent='请求失败：'+(e&&e.message||e);}};
 document.getElementById('f').onsubmit=async e=>{e.preventDefault();const t=e.target;await post('${base}/config',{config:{feedCount:Number(t.feedCount.value),watchSeconds:Number(t.watchSeconds.value),maxVideoBytes:Number(t.maxVideoBytes.value),requestTimeoutMs:Number(t.requestTimeoutMs.value),audioEnabled:t.audioEnabled.checked,framesToGallery:t.framesToGallery.checked}});};
 document.getElementById('i').onsubmit=async e=>{e.preventDefault();const t=e.target;await post('${base}/config',{config:{allowLike:t.allowLike.checked,allowCollect:t.allowCollect.checked,allowComment:t.allowComment.checked,allowFollow:t.allowFollow.checked}});};
@@ -1736,6 +1746,7 @@ document.getElementById('i').onsubmit=async e=>{e.preventDefault();const t=e.tar
         autoFeedScroll: patch.autoFeedScroll === undefined ? current.autoFeedScroll : bool(patch.autoFeedScroll, current.autoFeedScroll),
         autoInteractEnabled: patch.autoInteractEnabled === undefined ? current.autoInteractEnabled : bool(patch.autoInteractEnabled, current.autoInteractEnabled),
         autoInteractPersona: patch.autoInteractPersona === undefined ? current.autoInteractPersona : String(patch.autoInteractPersona || '').slice(0, 2000),
+        autoInteractPersonaDesc: patch.autoInteractPersonaDesc === undefined ? current.autoInteractPersonaDesc : String(patch.autoInteractPersonaDesc || '').slice(0, 2000),
         autoInteractWhitelist: patch.autoInteractWhitelist === undefined ? current.autoInteractWhitelist : String(patch.autoInteractWhitelist || '').slice(0, 2000),
         autoInteractMinShare: patch.autoInteractMinShare === undefined ? current.autoInteractMinShare : num(patch.autoInteractMinShare, current.autoInteractMinShare, 0, 1000000),
         autoInteractMaxPerRound: patch.autoInteractMaxPerRound === undefined ? current.autoInteractMaxPerRound : num(patch.autoInteractMaxPerRound, current.autoInteractMaxPerRound, 1, 3),
@@ -2153,6 +2164,133 @@ document.getElementById('i').onsubmit=async e=>{e.preventDefault();const t=e.tar
       .split(/[\r\n,，、;；]+/)
       .map((x) => x.trim().toLowerCase())
       .filter(Boolean);
+
+  // 一键生成人设关键词：优先借宿主当前人格，读不到再用设置页的「人格设定」。
+  let personaGenerating = false;
+  const KEYWORD_RULES =
+    '要求：只输出 8-12 个关键词，用中文逗号分隔；每个词 2-6 个字（AI 这类常见英文词可以保留）；' +
+    '要具体到能匹配视频标题的兴趣点（如摄影、胶片、城市漫步、手账、烘焙）；' +
+    '不要人名、平台名、宽泛词（视频、生活、内容、推荐、好看），不要编号、解释或整句话。';
+  const HOST_PERSONA_PROMPT =
+    '请严格依据你自己当前的人格设定（性格、兴趣、审美、擅长领域和说话风格），' +
+    '提炼一组用来在抖音挑选感兴趣内容的画像关键词。' + KEYWORD_RULES;
+  const descPersonaPrompt = (desc: string) =>
+    '下面是一段人格设定，请只依据它提炼一组用来在抖音挑选感兴趣内容的画像关键词。\n"""\n' +
+    desc.slice(0, 1500) +
+    '\n"""\n' + KEYWORD_RULES;
+
+  const personaKeywords = (raw: string): string[] => {
+    const generic = new Set(['关键词', '视频', '生活', '内容', '推荐', '抖音', '平台', '人设', '设定', '好看']);
+    const seen = new Set<string>();
+    const out: string[] = [];
+    for (const piece of String(raw ?? '').split(/[\s\r\n,，、;；|/]+/)) {
+      let word = piece.trim();
+      const colon = word.search(/[：:]/);
+      if (colon >= 0) word = word.slice(colon + 1).trim();
+      word = word
+        .replace(/^[「『"'`“”‘’#*•·\-—–\d.、）)]+/, '')
+        .replace(/[」』"'`“”‘’]+$/, '')
+        .replace(/[。！？!?…]+$/g, '')
+        .trim();
+      if (word.length < 2 || word.length > 10) continue;
+      if (generic.has(word) || /关键词|人格设定/.test(word)) continue;
+      const key = word.toLowerCase();
+      if (seen.has(key)) continue;
+      seen.add(key);
+      out.push(word);
+      if (out.length >= 12) break;
+    }
+    return out;
+  };
+
+  const generatePersonaKeywords = async (desc: string) => {
+    const reasons: string[] = [];
+    const timeout = () => {
+      try {
+        return AbortSignal.any([ctx.signal, AbortSignal.timeout(60000)]);
+      } catch {
+        return AbortSignal.timeout(60000);
+      }
+    };
+    const signal = timeout();
+
+    let hostReady = false;
+    try {
+      hostReady = ctx.personas.list().length > 0;
+    } catch {
+      hostReady = false;
+    }
+    if (hostReady) {
+      try {
+        const reply = await ctx.sessions.runTransient({ text: HOST_PERSONA_PROMPT, permission: 'off', signal });
+        const words = personaKeywords(reply);
+        if (words.length >= 3) return { source: 'host' as const, keywords: words };
+        reasons.push('宿主当前人格没给出可用关键词');
+      } catch (error: any) {
+        reasons.push('读宿主当前人格失败：' + String(error?.message ?? error));
+      }
+    } else {
+      reasons.push('宿主没有配置人格');
+    }
+
+    if (desc) {
+      let words: string[] = [];
+      try {
+        const chatModel = ctx.models.list('chat').find((model) => model.callable);
+        if (chatModel) {
+          const reply = await ctx.llm.chat({
+            model: chatModel.id,
+            messages: [{ role: 'user', content: descPersonaPrompt(desc) }],
+            max_tokens: 256,
+            signal,
+          });
+          words = personaKeywords(reply.text);
+        } else {
+          reasons.push('没有可直接调用的对话模型');
+        }
+      } catch (error: any) {
+        reasons.push('用模型生成失败：' + String(error?.message ?? error));
+      }
+      if (words.length < 3) {
+        try {
+          const reply = await ctx.sessions.runTransient({ text: descPersonaPrompt(desc), permission: 'off', signal });
+          words = personaKeywords(reply);
+        } catch (inner: any) {
+          reasons.push('回退到当前会话也失败：' + String(inner?.message ?? inner));
+        }
+      }
+      if (words.length >= 3) return { source: 'desc' as const, keywords: words };
+      reasons.push('人格设定没提炼出可用关键词');
+    }
+
+    throw Error(reasons.filter(Boolean).join('；') || '没有可用的人格来源');
+  };
+
+  ctx.web.api(`${base}/persona/gen`, async (req: any, res: any, context: any) => {
+    if (req.method && req.method !== 'POST') {
+      res.statusCode = 405;
+      res.end();
+      return;
+    }
+    try {
+      if (personaGenerating) {
+        sendJson(res, 200, { ok: false, error: '上一条还在生成，稍等几秒再点。' });
+        return;
+      }
+      const signal = context?.signal ?? ctx.signal;
+      const body = await readJson(req, signal);
+      const desc = String(body?.desc ?? '').trim().slice(0, 2000);
+      personaGenerating = true;
+      try {
+        const result = await generatePersonaKeywords(desc);
+        sendJson(res, 200, { ok: true, source: result.source, keywords: result.keywords, text: result.keywords.join('，') });
+      } finally {
+        personaGenerating = false;
+      }
+    } catch (error: any) {
+      sendJson(res, 200, { ok: false, error: String(error?.message ?? error) });
+    }
+  });
 
   // 命中设置页填的人设关键词 → 赞；命中白名单类型且分享数过门槛 → 赞。只点赞收藏，永不评论。
   // 只读插件自己的配置，不读取宿主全局配置或人格文件。
