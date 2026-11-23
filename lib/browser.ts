@@ -45,12 +45,28 @@ export type LoginState = {
   mode?: string | null;
 };
 
-type Spawned = { pid?: number; port: number; profile: string };
+type Spawned = { pid?: number; port: number; profile: string; child?: ReturnType<typeof spawn> };
 
 let current: Spawned | null = null;
 
 function stateFile(dir: string) {
   return join(dir, 'login.json');
+}
+
+// 只清理与指定 PID 对应的记录；PID 对不上时保留，避免把新窗口的记录误删。
+function clearSpawnedState(dir: string, pid?: number | null): void {
+  try {
+    if (pid) {
+      const stored = JSON.parse(readFileSync(stateFile(dir), 'utf8'));
+      if (Number(stored?.pid) !== pid) return;
+    }
+    rmSync(stateFile(dir), { force: true });
+  } catch {}
+}
+
+function forgetSpawned(dir: string, pid?: number | null): void {
+  if (current && (!pid || current.pid === pid)) current = null;
+  clearSpawnedState(dir, pid);
 }
 
 // 会话归属标记：open 时生成并写进专用 profile 的 localStorage，读 Cookie 前必须对上。
@@ -86,8 +102,10 @@ export function loginState(dir: string, preferredBrowser?: string): LoginState {
   }
   const pid = Number(stored?.pid) || null;
   const port = Number(stored?.port) || null;
-  let open = Boolean(current?.pid);
-  if (!open && pid) {
+  // 只认仍然存活的 ChildProcess；浏览器自己退出后即使 PID 被系统复用，也不再把记录当成窗口还开着。
+  let open = Boolean(current?.pid) &&
+    (!current?.child || (current.child.exitCode === null && current.child.signalCode === null));
+  if (!open && !current?.pid && pid) {
     try {
       process.kill(pid, 0);
       open = true;
@@ -184,23 +202,16 @@ async function closeBrowserViaCdp(port: number): Promise<boolean> {
   });
 }
 
-// 轮询确认浏览器已退出：调试端口握手失败，且（有记录 PID 时）进程也已不在。
-async function waitForExit(port: number, pid: number | null, timeoutMs: number): Promise<boolean> {
-  const pidAlive = (p: number | null): boolean => {
-    if (!p) return false;
-    try {
-      process.kill(p, 0);
-      return true;
-    } catch {
-      return false;
-    }
-  };
+// 轮询确认浏览器已退出：调试端口握手失败，且（本次持有 ChildProcess 时）进程确已退出。
+// 不看状态文件里的旧 PID，避免系统复用 PID 后把别的进程当成自家浏览器。
+async function waitForExit(port: number, child: ReturnType<typeof spawn> | null, timeoutMs: number): Promise<boolean> {
+  const childExited = (): boolean => !child || child.exitCode !== null || child.signalCode !== null;
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
-    if (!(await cdpAlive(port)) && !pidAlive(pid)) return true;
+    if (!(await cdpAlive(port)) && childExited()) return true;
     await sleep(300);
   }
-  return !(await cdpAlive(port)) && !pidAlive(pid);
+  return !(await cdpAlive(port)) && childExited();
 }
 
 export type WindowMode = 'visible' | 'offscreen' | 'headless';
@@ -485,7 +496,12 @@ export async function openLoginWindow(
   try {
     const child = spawn(browser, args, { detached: true, stdio: 'ignore', windowsHide: false });
     child.unref();
-    current = { pid: child.pid, port, profile };
+    // 浏览器自行退出时清掉本次的记录；只清 PID 对得上的那条，避免覆盖后来新开的窗口。
+    child.once('exit', () => {
+      if (current?.pid === child.pid) current = null;
+      clearSpawnedState(dir, child.pid);
+    });
+    current = { pid: child.pid, port, profile, child };
     writeFileSync(stateFile(dir), JSON.stringify({ pid: child.pid, port, profile, mode, token: sessionToken, at: Date.now() }, null, 2), 'utf8');
     const ready = await Promise.race([storageReady(port), sleep(3000).then(() => false)]);
     // 新窗口由本插件启动，归属天然成立；就绪后把标记写进它的 localStorage，供后续归属核对。
@@ -499,41 +515,51 @@ export async function openLoginWindow(
 }
 
 /**
- * 停用/卸载时的同步收尾：只杀本进程自己 spawn 出来的窗口，PID 可信，不按状态文件里的旧 PID 强杀。
- * 插件卸下后没有事件循环可用，所以这里必须是同步的。
+ * 停用/卸载时的同步收尾：只处理本进程仍持有的 ChildProcess，不按 login.json 里的旧 PID 强杀。
+ * 浏览器自行退出后 ChildProcess 的 exitCode 已经落定，这里只会清记录，不会再碰可能被复用的 PID。
  */
 export function closeSpawnedLoginWindow(dir: string): boolean {
-  const pid = current?.pid;
+  const entry = current;
+  if (!entry?.pid) {
+    clearSpawnedState(dir);
+    return false;
+  }
+  const child = entry.child;
+  // 没有 ChildProcess 引用就不具备确认归属的条件，只清记录，绝不按裸 PID 下手。
+  const alive = Boolean(child) && child!.exitCode === null && child!.signalCode === null;
+  if (alive) {
+    try {
+      child!.kill();
+    } catch {}
+  }
   current = null;
-  if (!pid) return false;
-  try {
-    process.kill(pid);
-  } catch {}
-  try {
-    rmSync(stateFile(dir), { force: true });
-  } catch {}
-  return true;
+  clearSpawnedState(dir, entry.pid);
+  return alive;
 }
 
 export async function closeLoginWindow(dir: string, port: number): Promise<{ ok: boolean; message: string; open: boolean }> {
-  const stored = loginState(dir);
-
-  // 本来就没有窗口：如实回执「已经关着」，顺手清掉过期的状态文件，不再报归属不明。
-  if (!stored.open && !(await cdpAlive(port))) {
-    current = null;
-    try {
-      rmSync(stateFile(dir), { force: true });
-    } catch {}
-    return { ok: true, open: false, message: '登录窗口已经关着，不用再关。' };
-  }
-
-  // 端口失联：无法确认归属，保留进程与会话记录，不报成功、不清记录。
+  // 端口已经不在了：本次启动的 ChildProcess 若还活着，按确认归属结束它；
+  // 若它已经退出（或本次进程没有记录），说明窗口早就关了，直接回「已经关闭」，绝不按旧 PID 去杀别的进程。
   if (!(await cdpAlive(port))) {
-    return {
-      ok: false,
-      open: true,
-      message: '调试端口无响应，无法确认这个进程仍属于当前实例，未关闭。请在任务管理器手动确认后关闭，或重新打开专用窗口。',
-    };
+    const child = current?.child;
+    if (child && child.exitCode === null && child.signalCode === null) {
+      try {
+        child.kill();
+      } catch {}
+      const exited = await waitForExit(port, child, 4000);
+      if (exited) {
+        forgetSpawned(dir, child.pid);
+        return { ok: true, open: false, message: '登录窗口已经关闭。' };
+      }
+      return {
+        ok: false,
+        open: true,
+        message: '已发出关闭，但暂时无法确认浏览器是否退出；进程与会话记录均已保留。请手动确认窗口状态，或重新打开专用窗口后再关闭。',
+      };
+    }
+    // 没有仍在运行的、可确认归属的浏览器：清理过期记录，不碰任何 PID。
+    forgetSpawned(dir, current?.pid);
+    return { ok: true, open: false, message: '登录窗口已经关闭，不用再关。' };
   }
 
   // 会话标记对不上：归属未确认，保留进程与记录。
@@ -555,7 +581,9 @@ export async function closeLoginWindow(dir: string, port: number): Promise<{ ok:
   }
 
   // 必须等到退出得到确认（端口握手失败、进程不在）才报成功并清记录；退出失败或结果未知则保留记录。
-  const exited = await waitForExit(port, stored.pid, 5000);
+  // 插件重启后没有 ChildProcess 时只核对端口，避免被复用的旧 PID 拖成假失败。
+  const trackedChild = current?.child ?? null;
+  const exited = await waitForExit(port, trackedChild, 5000);
   if (!exited) {
     return {
       ok: false,
@@ -564,10 +592,7 @@ export async function closeLoginWindow(dir: string, port: number): Promise<{ ok:
     };
   }
 
-  current = null;
-  try {
-    rmSync(stateFile(dir), { force: true });
-  } catch {}
+  forgetSpawned(dir, trackedChild?.pid ?? null);
   return {
     ok: true,
     open: false,

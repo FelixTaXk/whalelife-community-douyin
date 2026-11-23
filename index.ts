@@ -1828,9 +1828,9 @@ document.getElementById('i').onsubmit=async e=>{e.preventDefault();const t=e.tar
 
   ctx.web.api(`${base}/login/close`, async (_req: any, res: any) => {
     const result = await closeLoginWindow(DATA_DIR, config.loginPort);
-    // 关完重新实测调试端口：拒绝关闭或退出未确认时窗口仍在，open 必须反映真实状态，不能硬编码 false。
+    // 以关闭函数的结论为准，再用实测端口兜底：退出未确认时不能把 open 硬编码成 false。
     const cdp = await cdpAlive(config.loginPort);
-    sendJson(res, 200, { ok: result.ok, message: result.message, open: cdp, portOpen: cdp });
+    sendJson(res, 200, { ok: result.ok, message: result.message, open: result.open || cdp, portOpen: cdp });
   });
 
   ctx.web.api(`${base}/login/import`, async (_req: any, res: any) => {
