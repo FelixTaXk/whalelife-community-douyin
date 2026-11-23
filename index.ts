@@ -1661,7 +1661,7 @@ const showBtn=document.getElementById('show');
 const syncShowBtn=(open,mode)=>{winMode=String(mode||'');const can=Boolean(open)&&winMode!=='headless';showBtn.textContent=winMode==='visible'?'隐藏窗口':'显示窗口';showBtn.disabled=!can;showBtn.title=can?'':(winMode==='headless'?'无界面模式没有窗口可显示或隐藏':'窗口没开着');};
 const callLogin=async(name)=>{say('处理中…',true);try{const r=await fetch('${base}/login/'+name+'?_='+Date.now(),{method:'POST',headers:{'Content-Type':'application/json'},body:'{}',cache:'no-store'});const j=await r.json();say((j.message||(j.ok?'完成。':'失败。'))+(j.count?(' · 读到 '+j.count+' 个 Cookie'):''),j.ok!==false);if(name==='import'&&j.loggedIn)setBadge(true);refreshLogin();return j;}catch(e){say('请求失败：'+(e&&e.message||e),false);}};
 const refreshReply=async()=>{try{const j=await postJson('reply/state',{});const el=document.getElementById('replyMsg');if(!el)return;const parts=[];parts.push('本轮剩余配额 '+(j.remaining??0)+' 条');if(j.lastRunAt)parts.push('上次回评 '+new Date(j.lastRunAt).toLocaleTimeString('zh-CN'));if(j.verifyUntil&&new Date(j.verifyUntil)>new Date())parts.push('验证码冷却到 '+new Date(j.verifyUntil).toLocaleTimeString('zh-CN'));if(j.repliedTotal)parts.push('累计已回 '+j.repliedTotal+' 条');el.textContent=parts.join(' ｜ ');}catch(e){}};
-const refreshLogin=async()=>{try{const j=await stateGet('${base}/login/state?_='+Date.now());const mn={visible:'可见',offscreen:'隐藏',headless:'无界面'};const label=j.open?('已打开（'+((j.mode&&mn[j.mode])||'可用')+'）'):(j.portOpen?'端口在听但连不上，关掉重开一次':'未打开');const br=j.browser?String(j.browser).split(/[\\\\/]/).pop():'没找到浏览器';const ch=j.challenge==='sms'?' ｜ 要短信验证':(j.challenge==='captcha'?' ｜ 挂着滑块/安全验证':'');stateEl.textContent='窗口状态：'+label+' ｜ 端口 '+(j.port||'?')+' ｜ 浏览器 '+br+ch;syncShowBtn(j.open,j.mode);}catch(e){stateEl.textContent='窗口状态：读取失败，刷新页面重试';}};
+const refreshLogin=async()=>{try{const j=await stateGet('${base}/login/state?_='+Date.now());const mn={visible:'可见',offscreen:'隐藏',headless:'无界面'};const label=j.open?('已打开（'+((j.mode&&mn[j.mode])||'可用')+'）'):'未打开';const portLabel=j.open?'本实例窗口':(j.portOpen?'被占用（未确认本实例窗口）':'空闲');const br=j.browser?String(j.browser).split(/[\\\\/]/).pop():'没找到浏览器';const ch=j.challenge==='sms'?' ｜ 要短信验证':(j.challenge==='captcha'?' ｜ 挂着滑块/安全验证':'');stateEl.textContent='窗口状态：'+label+' ｜ 端口 '+(j.port||'?')+'：'+portLabel+' ｜ 浏览器 '+br+ch;syncShowBtn(j.open,j.mode);}catch(e){stateEl.textContent='窗口状态：读取失败，刷新页面重试';}};
 refreshLogin(); setInterval(refreshLogin,5000);
 document.getElementById('open').onclick=()=>callLogin('open');
 document.getElementById('show').onclick=()=>callLogin(winMode==='visible'?'hide':'show');
@@ -1781,21 +1781,26 @@ document.getElementById('i').onsubmit=async e=>{e.preventDefault();const t=e.tar
 
   ctx.web.api(`${base}/login/state`, async (_req: any, res: any) => {
     const state = loginState(DATA_DIR, config.browserPath);
-    // 唯一判据：CDP 能不能握手。PID、端口在听都会骗人，握手成功才算真的能用。
+    // 端口在听不等于窗口可用：必须先核对会话归属，普通 HTTP 服务占端口时不能显示成已打开。
     const cdp = await cdpAlive(config.loginPort);
+    const check = cdp ? await verifySession(DATA_DIR, config.loginPort) : null;
+    const owned = Boolean(check?.owned);
     const listening = cdp ? true : await portOpenFn(config.loginPort);
-    // 页面上挂着验证码时提前告诉用户，省得发布/读作品时才撞墙。
-    const challenge = cdp ? await pageChallenge(config.loginPort) : '';
+    // 只有确认是本实例窗口时才检查页面状态，避免探测到别的本地服务。
+    const challenge = owned ? await pageChallenge(config.loginPort) : '';
     sendJson(res, 200, {
       ok: true,
-      open: cdp,
+      open: owned,
+      owned,
       portOpen: listening,
-      pid: state.pid,
+      portOccupied: listening && !owned,
+      ownershipReason: owned ? '' : (check?.reason ?? ''),
+      pid: owned ? state.pid : null,
       port: config.loginPort,
       browser: state.browser,
       challenge,
-      mode: state.mode,
-      profile: state.profile,
+      mode: owned ? state.mode : null,
+      profile: owned ? state.profile : null,
     });
   });
 
@@ -1803,14 +1808,18 @@ document.getElementById('i').onsubmit=async e=>{e.preventDefault();const t=e.tar
     const result = await openLoginWindow(DATA_DIR, config.loginPort, 'https://www.douyin.com/', config.windowMode, config.browserPath);
     // 归属标记由 browser.ts 在新窗口就绪后写入，这里不再重复写。
     const cdp = await cdpAlive(config.loginPort);
-    sendJson(res, 200, { ok: result.ok, message: result.message, open: cdp || result.ok, portOpen: cdp });
+    const check = cdp ? await verifySession(DATA_DIR, config.loginPort) : null;
+    const owned = Boolean(check?.owned);
+    sendJson(res, 200, { ok: result.ok, message: result.message, open: result.ok && owned, owned, portOpen: cdp, portOccupied: cdp && !owned });
   });
 
   ctx.web.api(`${base}/login/show`, async (_req: any, res: any) => {
     try {
       const result = await showLoginWindow(DATA_DIR, config.loginPort);
       const cdp = await cdpAlive(config.loginPort);
-      sendJson(res, 200, { ok: result.ok, message: result.message, open: cdp, portOpen: cdp });
+      const check = cdp ? await verifySession(DATA_DIR, config.loginPort) : null;
+      const owned = Boolean(check?.owned);
+      sendJson(res, 200, { ok: result.ok, message: result.message, open: cdp && owned, owned, portOpen: cdp, portOccupied: cdp && !owned });
     } catch (error: any) {
       sendJson(res, 200, { ok: false, message: String(error?.message ?? error).slice(0, 200) });
     }
@@ -1820,7 +1829,9 @@ document.getElementById('i').onsubmit=async e=>{e.preventDefault();const t=e.tar
     try {
       const result = await hideLoginWindow(DATA_DIR, config.loginPort);
       const cdp = await cdpAlive(config.loginPort);
-      sendJson(res, 200, { ok: result.ok, message: result.message, open: cdp, portOpen: cdp });
+      const check = cdp ? await verifySession(DATA_DIR, config.loginPort) : null;
+      const owned = Boolean(check?.owned);
+      sendJson(res, 200, { ok: result.ok, message: result.message, open: cdp && owned, owned, portOpen: cdp, portOccupied: cdp && !owned });
     } catch (error: any) {
       sendJson(res, 200, { ok: false, message: String(error?.message ?? error).slice(0, 200) });
     }
@@ -1830,7 +1841,9 @@ document.getElementById('i').onsubmit=async e=>{e.preventDefault();const t=e.tar
     const result = await closeLoginWindow(DATA_DIR, config.loginPort);
     // 以关闭函数的结论为准，再用实测端口兜底：退出未确认时不能把 open 硬编码成 false。
     const cdp = await cdpAlive(config.loginPort);
-    sendJson(res, 200, { ok: result.ok, message: result.message, open: result.open || cdp, portOpen: cdp });
+    const check = cdp ? await verifySession(DATA_DIR, config.loginPort) : null;
+    const owned = Boolean(check?.owned);
+    sendJson(res, 200, { ok: result.ok, message: result.message, open: cdp && owned, owned, portOpen: cdp, portOccupied: cdp && !owned });
   });
 
   ctx.web.api(`${base}/login/import`, async (_req: any, res: any) => {
